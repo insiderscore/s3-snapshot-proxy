@@ -7,6 +7,7 @@ import boto3
 from datetime import datetime, timezone
 import logging
 import sys
+import xml.etree.ElementTree as ET
 
 # Set up logging
 logging.basicConfig(
@@ -182,6 +183,112 @@ async def handle_get_head_fallback(
                 new_response = await handle_precondition_failure(method, full_path, original_headers, body, new_response)
             return new_response
     return response
+
+def merged_list_to_xml(merged_list, bucket, prefix):
+    """
+    Convert the merged list of versions into an XML document that emulates S3's ListObjectVersionsResult.
+    (This is a simplified schema; adjust fields as needed.)
+    """
+    root = ET.Element("ListVersionsResult")
+
+    name = ET.SubElement(root, "Name")
+    name.text = bucket
+
+    pre = ET.SubElement(root, "Prefix")
+    pre.text = prefix
+
+    # Precompute the maximum LastModified for each key.
+    latest_by_key = {}
+    for item in merged_list:
+        key = item.get("Key", "")
+        lm = item.get("LastModified")
+        if lm:
+            if key not in latest_by_key or lm > latest_by_key[key]:
+                latest_by_key[key] = lm
+
+    # For each entry in the merged list, add a <Version> or <DeleteMarker> element depending on ItemType.
+    for item in merged_list:
+        item_type = item.get("ItemType", "Version")
+        elem = ET.SubElement(root, item_type)
+        key_elem = ET.SubElement(elem, "Key")
+        key_elem.text = item.get("Key", "")
+
+        version_id_elem = ET.SubElement(elem, "VersionId")
+        version_id_elem.text = item.get("VersionId", "")
+
+        is_latest_elem = ET.SubElement(elem, "IsLatest")
+        # Mark as latest only if this item's LastModified equals the maximum for that key.
+        last_modified = item.get("LastModified")
+        key_val = item.get("Key", "")
+        if last_modified and latest_by_key.get(key_val) == last_modified:
+            is_latest_elem.text = "true"
+        else:
+            is_latest_elem.text = "false"
+
+        last_modified_elem = ET.SubElement(elem, "LastModified")
+        last_modified = item.get("LastModified")
+        last_modified_elem.text = last_modified.isoformat() if last_modified else ""
+
+    return ET.tostring(root, encoding="utf-8", method="xml")
+
+@app.get("/{bucket}")
+async def list_object_versions(bucket: str, prefix: str = "", versions: str = None):
+    """
+    Emulate S3 ListObjectVersions.
+
+    If the query parameter 'versions' is present, this endpoint returns a merged list:
+      - Origin: Lists object versions on the origin bucket filtered to those before START_TIME.
+      - Overlay: Lists object versions in the overlay bucket (stored under "<bucket>/<key>") that override the origin.
+
+    Otherwise, this route may be used for regular GET operations.
+    """
+    if versions is not None:
+        # List object versions from origin bucket
+        s3_client_origin = boto3.client("s3")
+        origin_resp = s3_client_origin.list_object_versions(Bucket=bucket, Prefix=prefix)
+
+        origin_items = []
+        if "Versions" in origin_resp:
+            for ver in origin_resp["Versions"]:
+                if ver["LastModified"] < START_TIME:
+                    ver["ItemType"] = "Version"
+                    origin_items.append(ver)
+        if "DeleteMarkers" in origin_resp:
+            for dm in origin_resp["DeleteMarkers"]:
+                if dm["LastModified"] < START_TIME:
+                    dm["ItemType"] = "DeleteMarker"
+                    origin_items.append(dm)
+
+        # List object versions from the overlay bucket.
+        overlay_bucket = OVERLAY_BUCKET
+        overlay_prefix = f"{bucket}{prefix}" if prefix else bucket
+        s3_client_overlay = boto3.client(
+            "s3",
+            aws_access_key_id=overlay_credentials.access_key,
+            aws_secret_access_key=overlay_credentials.secret_key,
+            aws_session_token=overlay_credentials.token,
+            endpoint_url=OVERLAY_S3_URL  # Use the overlay S3 endpoint
+        )
+        overlay_resp = s3_client_overlay.list_object_versions(Bucket=overlay_bucket, Prefix=overlay_prefix)
+
+        merged_list = origin_items[:]  # start with all origin items
+        if "Versions" in overlay_resp:
+            for over in overlay_resp["Versions"]:
+                over["ItemType"] = "Version"
+                merged_list.append(over)
+        if "DeleteMarkers" in overlay_resp:
+            for dm in overlay_resp["DeleteMarkers"]:
+                dm["ItemType"] = "DeleteMarker"
+                merged_list.append(dm)
+
+        # Optionally sort by LastModified descending.
+        merged_list.sort(key=lambda x: x["LastModified"], reverse=True)
+
+        xml_response = merged_list_to_xml(merged_list, bucket, prefix)
+        return Response(content=xml_response, media_type="application/xml")
+
+    # Fallback: if no 'versions' query parameter is passed, handle as a regular GET on the bucket.
+    return {"message": f"Regular GET for bucket: {bucket} with prefix: {prefix}"}
 
 @app.api_route("/{full_path:path}", methods=["GET", "PUT", "DELETE", "HEAD"])
 async def proxy(full_path: str, request: Request):
