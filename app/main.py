@@ -6,6 +6,14 @@ from httpx_auth import AWS4Auth
 import boto3
 from datetime import datetime, timezone
 import logging
+import sys
+
+# Set up logging
+logging.basicConfig(
+    level=logging.INFO,
+    stream=sys.stdout,
+    format="%(asctime)s %(levelname)s %(name)s %(message)s"
+)
 
 app = FastAPI()
 
@@ -47,6 +55,8 @@ def rewrite_overlay_path(original_path: str) -> str:
 async def proxy(full_path: str, request: Request):
     method = request.method
     original_headers = dict(request.headers)
+    logging.info("Received %s request for %s", method, full_path)
+    
     # Use filtered headers for overlay S3 request
     overlay_headers = {
         k: v
@@ -57,18 +67,36 @@ async def proxy(full_path: str, request: Request):
 
     overlay_path = rewrite_overlay_path(full_path)
     overlay_url = f"{OVERLAY_S3_URL}/{quote(overlay_path)}"
+    
+    # For DELETE requests, apply our facilitator workaround:
+    if method == "DELETE":
+        # Create a zero-length facilitator object so that a deletion marker will be produced.
+        facilitator_headers = overlay_headers.copy()
+        facilitator_headers["x-rtwa-delete-marker-facilitator"] = "true"
+        logging.info("Creating facilitator object for deletion marker workaround: PUT %s", overlay_url)
+        facilitator_response = await signed_client.put(overlay_url, headers=facilitator_headers, content=b"")
+        logging.info("Facilitator creation response status: %s", facilitator_response.status_code)
+        
+        # Now delete that facilitator object, which should create a proper delete marker.
+        logging.info("Deleting facilitator object: DELETE %s", overlay_url)
+        response = await signed_client.request("DELETE", overlay_url, headers=overlay_headers, content=body)
+        logging.info("Delete response (workaround) status: %s, headers: %s", response.status_code, dict(response.headers))
+    else:
+        logging.info("Sending overlay request: %s %s", method, overlay_url)
+        response = await signed_client.request(method, overlay_url, headers=overlay_headers, content=body)
+        logging.info("Overlay response status: %s, headers: %s", response.status_code, dict(response.headers))
+    
+    # For GET or HEAD, if the overlay response includes the facilitator header, treat it as a deletion marker.
+    if method in {"GET", "HEAD"} and response.headers.get("x-rtwa-delete-marker-facilitator", "false").lower() == "true":
+        logging.info("Overlay response includes facilitator header; treating as delete marker (404)")
+        response = httpx.Response(status_code=404, content=b"", headers=response.headers)
 
-    # Forward request to overlay S3 using our signed client.
-    response = await signed_client.request(method, overlay_url, headers=overlay_headers, content=body)
-
-    # Fallback only on GET or HEAD 404 if no delete marker is involved
+    # Fallback: if GET or HEAD from overlay returns 404 without a delete marker indicator, try origin.
     if method in {"GET", "HEAD"} and response.status_code == 404:
         if response.headers.get("x-amz-delete-marker", "false").lower() != "true":
             origin_url = f"{ORIGIN_S3_URL}/{quote(full_path)}"
-            # Use the original headers (including any auth headers) for origin S3
             origin_headers = original_headers.copy()
 
-            # Adjust If-Unmodified-Since header if needed
             proxy_start_str = START_TIME.strftime("%a, %d %b %Y %H:%M:%S GMT")
             existing_ius = origin_headers.get("if-unmodified-since")
             if not existing_ius:
@@ -81,7 +109,9 @@ async def proxy(full_path: str, request: Request):
                 except ValueError:
                     origin_headers["If-Unmodified-Since"] = proxy_start_str
 
+            logging.info("Fallback to origin S3: %s %s", method, origin_url)
             response = await client.request(method, origin_url, headers=origin_headers, content=body)
+            logging.info("Origin response status: %s", response.status_code)
 
     return Response(
         content=response.content,
