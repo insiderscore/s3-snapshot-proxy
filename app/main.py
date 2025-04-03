@@ -68,6 +68,48 @@ async def handle_delete_workaround(overlay_url: str, overlay_headers: dict, body
     logging.info("Delete response (workaround) status: %s, headers: %s", response.status_code, dict(response.headers))
     return response
 
+async def handle_precondition_failure(
+    method: str, full_path: str, original_headers: dict, body: bytes, response: httpx.Response
+) -> httpx.Response:
+    """
+    If the origin request returns a 412 Precondition Failed, use ListObjectVersions to determine whether
+    a version of the object existed before START_TIME. If found, append the versionId as a subresource 
+    to the object path and retry the request.
+    """
+    if response.status_code != 412:
+        return response
+
+    # Parse bucket and key from full_path (assumes format "bucket/key")
+    parts = full_path.strip("/").split("/", 1)
+    if len(parts) == 2:
+        bucket, key = parts
+    else:
+        bucket, key = parts[0], ""
+
+    logging.info("Received 412. Listing object versions for bucket: %s, key: %s", bucket, key)
+    s3_client = boto3.client("s3")
+    versions_response = s3_client.list_object_versions(Bucket=bucket, Prefix=key)
+    
+    candidate = None
+    candidate_time = None
+    if "Versions" in versions_response:
+        for ver in versions_response["Versions"]:
+            last_modified = ver["LastModified"]
+            if last_modified < START_TIME:
+                if candidate is None or last_modified > candidate_time:
+                    candidate = ver
+                    candidate_time = last_modified
+
+    if candidate is None:
+        logging.info("No matching version found for key %s before START_TIME.", key)
+        return response
+
+    version_id = candidate["VersionId"]
+    logging.info("Found version %s. Retrying origin request with version subresource.", version_id)
+    origin_url = f"{ORIGIN_S3_URL}/{quote(full_path)}?versionId={version_id}"
+    new_response = await client.request(method, origin_url, headers=original_headers, content=body)
+    return new_response
+
 async def handle_get_head_fallback(
     method: str,
     full_path: str,
@@ -76,8 +118,9 @@ async def handle_get_head_fallback(
     response: httpx.Response
 ) -> httpx.Response:
     """
-    If the GET or HEAD request to the overlay bucket returns a 404 and there is no delete marker,
-    fall back to origin S3.
+    If the GET or HEAD request to the overlay bucket returns a 404 (and no delete marker),
+    fall back to origin S3. Additionally, if the origin response is 412,
+    try to recover by retrying with a specific version ID.
     """
     if method in {"GET", "HEAD"} and response.status_code == 404:
         if response.headers.get("x-amz-delete-marker", "false").lower() != "true":
@@ -99,6 +142,8 @@ async def handle_get_head_fallback(
             logging.info("Fallback to origin S3: %s %s", method, origin_url)
             new_response = await client.request(method, origin_url, headers=origin_headers, content=body)
             logging.info("Origin response status: %s", new_response.status_code)
+            if new_response.status_code == 412:
+                new_response = await handle_precondition_failure(method, full_path, original_headers, body, new_response)
             return new_response
     return response
 
@@ -110,12 +155,10 @@ async def proxy(full_path: str, request: Request):
     
     # Use filtered headers for overlay S3 request.
     overlay_headers = {
-        k: v
-        for k, v in original_headers.items()
+        k: v for k, v in original_headers.items() 
         if not k.lower().startswith("authorization") and not k.lower().startswith("x-amz")
     }
     body = await request.body()
-
     overlay_path = rewrite_overlay_path(full_path)
     overlay_url = f"{OVERLAY_S3_URL}/{quote(overlay_path)}"
     
@@ -126,14 +169,14 @@ async def proxy(full_path: str, request: Request):
         response = await signed_client.request(method, overlay_url, headers=overlay_headers, content=body)
         logging.info("Overlay response status: %s, headers: %s", response.status_code, dict(response.headers))
     
-    # For GET or HEAD, if the overlay response includes the facilitator header, treat it as a delete marker.
+    # For GET/HEAD, if the overlay response includes the facilitator header, treat it as delete marker.
     if method in {"GET", "HEAD"} and response.headers.get("x-rtwa-delete-marker-facilitator", "false").lower() == "true":
         logging.info("Overlay response includes facilitator header; treating as delete marker (404)")
         response = httpx.Response(status_code=404, content=b"", headers=response.headers)
-
-    # Use the helper to fallback to origin S3 if needed
+    
+    # Fallback to origin S3 if applicable, including 412 precondition handling.
     response = await handle_get_head_fallback(method, full_path, original_headers, body, response)
-
+    
     return Response(
         content=response.content,
         status_code=response.status_code,
