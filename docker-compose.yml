@@ -1,23 +1,36 @@
-version: '3.8'
+version: "3.8"
 
 services:
   s3proxy:
     build: .
     ports:
-      - "9000:9000"
+      - "9003:9000"
     environment:
       - OVERLAY_S3_URL=http://minio-overlay:9000
       - OVERLAY_BUCKET=overlay
       - ORIGIN_S3_URL=https://s3.amazonaws.com
       - AWS_REGION=us-east-1
+      - AWS_ACCESS_KEY_ID=overlay-access
+      - AWS_SECRET_ACCESS_KEY=overlay-secret
     depends_on:
       - minio-overlay
+      - minio-init
 
   minio-overlay:
     image: minio/minio
     command: server /data --console-address ":9001"
     ports:
       - "9001:9001"
+      - "9000:9000"
     environment:
       MINIO_ACCESS_KEY: overlay-access
       MINIO_SECRET_KEY: overlay-secret
+
+  minio-init:
+    image: minio/mc
+    depends_on:
+      - minio-overlay
+    entrypoint: >
+      /bin/sh -c "until mc alias set local http://minio-overlay:9000 overlay-access overlay-secret; do sleep 1; done;
+      mc mb local/overlay || true;
+      mc version enable local/overlay;"
