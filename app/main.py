@@ -132,8 +132,8 @@ async def handle_precondition_failure(
                     candidate_time = last_modified
 
     if candidate is None:
-        logging.info("No matching version found for key %s before START_TIME.", key)
-        return response
+        logging.info("No matching version found for key %s before START_TIME. Returning 404.", key)
+        return httpx.Response(status_code=404, content=b"")
 
     version_id = candidate["VersionId"]
     logging.info("Found version %s. Retrying origin request with version subresource.", version_id)
