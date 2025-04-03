@@ -253,7 +253,13 @@ async def list_objects_handler(bucket: str, request: Request, prefix: str = ""):
         continuation_token = params.get("continuation-token")
 
         # STEP 1: Get version information from origin.
-        s3_client_origin = boto3.client("s3")  # Initialize the S3 client
+        s3_client_origin = boto3.client(
+            "s3",
+            aws_access_key_id=origin_credentials.access_key,
+            aws_secret_access_key=origin_credentials.secret_key,
+            aws_session_token=origin_credentials.token,
+            endpoint_url=ORIGIN_S3_URL  # Explicitly set the origin S3 endpoint
+        )
         logging.info("Querying origin bucket with Prefix: %s and Delimiter: %s", prefix or "", delimiter)
         origin_params = {"Bucket": bucket, "Prefix": prefix or ""}
         if delimiter:
@@ -296,7 +302,7 @@ async def list_objects_handler(bucket: str, request: Request, prefix: str = ""):
             overlay_params["Delimiter"] = delimiter
         logging.info("Overlay query parameters: %s", overlay_params)
         overlay_resp = s3_client_overlay.list_object_versions(**overlay_params)
-        logging.info("Overlay response: %s", overlay_resp)
+        logging.debug("Overlay response: %s", overlay_resp)
         if "Versions" in overlay_resp:
             for ver in overlay_resp["Versions"]:
                 ver["ItemType"] = "Version"
