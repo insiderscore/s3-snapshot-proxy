@@ -68,6 +68,40 @@ async def handle_delete_workaround(overlay_url: str, overlay_headers: dict, body
     logging.info("Delete response (workaround) status: %s, headers: %s", response.status_code, dict(response.headers))
     return response
 
+async def handle_get_head_fallback(
+    method: str,
+    full_path: str,
+    original_headers: dict,
+    body: bytes,
+    response: httpx.Response
+) -> httpx.Response:
+    """
+    If the GET or HEAD request to the overlay bucket returns a 404 and there is no delete marker,
+    fall back to origin S3.
+    """
+    if method in {"GET", "HEAD"} and response.status_code == 404:
+        if response.headers.get("x-amz-delete-marker", "false").lower() != "true":
+            origin_url = f"{ORIGIN_S3_URL}/{quote(full_path)}"
+            origin_headers = original_headers.copy()
+
+            proxy_start_str = START_TIME.strftime("%a, %d %b %Y %H:%M:%S GMT")
+            existing_ius = origin_headers.get("if-unmodified-since")
+            if not existing_ius:
+                origin_headers["If-Unmodified-Since"] = proxy_start_str
+            else:
+                try:
+                    parsed_ius = datetime.strptime(existing_ius, "%a, %d %b %Y %H:%M:%S GMT").replace(tzinfo=timezone.utc)
+                    if parsed_ius > START_TIME:
+                        origin_headers["If-Unmodified-Since"] = proxy_start_str
+                except ValueError:
+                    origin_headers["If-Unmodified-Since"] = proxy_start_str
+
+            logging.info("Fallback to origin S3: %s %s", method, origin_url)
+            new_response = await client.request(method, origin_url, headers=origin_headers, content=body)
+            logging.info("Origin response status: %s", new_response.status_code)
+            return new_response
+    return response
+
 @app.api_route("/{full_path:path}", methods=["GET", "PUT", "DELETE", "HEAD"])
 async def proxy(full_path: str, request: Request):
     method = request.method
@@ -97,27 +131,8 @@ async def proxy(full_path: str, request: Request):
         logging.info("Overlay response includes facilitator header; treating as delete marker (404)")
         response = httpx.Response(status_code=404, content=b"", headers=response.headers)
 
-    # Fallback: if GET or HEAD from overlay returns 404 without a delete marker indicator, try origin.
-    if method in {"GET", "HEAD"} and response.status_code == 404:
-        if response.headers.get("x-amz-delete-marker", "false").lower() != "true":
-            origin_url = f"{ORIGIN_S3_URL}/{quote(full_path)}"
-            origin_headers = original_headers.copy()
-
-            proxy_start_str = START_TIME.strftime("%a, %d %b %Y %H:%M:%S GMT")
-            existing_ius = origin_headers.get("if-unmodified-since")
-            if not existing_ius:
-                origin_headers["If-Unmodified-Since"] = proxy_start_str
-            else:
-                try:
-                    parsed_ius = datetime.strptime(existing_ius, "%a, %d %b %Y %H:%M:%S GMT").replace(tzinfo=timezone.utc)
-                    if parsed_ius > START_TIME:
-                        origin_headers["If-Unmodified-Since"] = proxy_start_str
-                except ValueError:
-                    origin_headers["If-Unmodified-Since"] = proxy_start_str
-
-            logging.info("Fallback to origin S3: %s %s", method, origin_url)
-            response = await client.request(method, origin_url, headers=origin_headers, content=body)
-            logging.info("Origin response status: %s", response.status_code)
+    # Use the helper to fallback to origin S3 if needed
+    response = await handle_get_head_fallback(method, full_path, original_headers, body, response)
 
     return Response(
         content=response.content,
