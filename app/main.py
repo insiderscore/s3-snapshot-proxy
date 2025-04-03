@@ -8,6 +8,7 @@ from datetime import datetime, timezone
 import logging
 import sys
 import xml.etree.ElementTree as ET
+from collections import defaultdict
 
 # Set up logging
 logging.basicConfig(
@@ -232,23 +233,195 @@ def merged_list_to_xml(merged_list, bucket, prefix):
     return ET.tostring(root, encoding="utf-8", method="xml")
 
 @app.get("/{bucket}")
-async def list_object_versions(bucket: str, prefix: str = "", versions: str = None):
+async def list_objects_handler(bucket: str, request: Request, prefix: str = ""):
     """
-    Emulate S3 ListObjectVersions.
+    Dispatch S3 list requests based on query parameters.
 
-    If the query parameter 'versions' is present, this endpoint returns a merged list:
-      - Origin: Lists object versions on the origin bucket filtered to those before START_TIME.
-      - Overlay: Lists object versions in the overlay bucket (stored under "<bucket>/<key>") that override the origin.
-
-      - FIXME: Will probably have a meltdown if there are too many versions under prefix
-
-    Otherwise, this route may be used for regular GET operations.
+    - If query parameter list-type=2 is present, process as ListObjectsV2.
+    - If query parameter versions is present, process as ListObjectVersions.
+    - Otherwise, handle as a regular GET.
     """
-    if versions is not None:
-        # List object versions from origin bucket
+    params = request.query_params
+    list_type = params.get("list-type")
+    versions = params.get("versions")
+    delimiter = params.get("delimiter")
+
+
+    if list_type == "2":
+        # ----- ListObjectsV2 logic -----
+        max_keys = int(params.get("max-keys", "1000"))
+        continuation_token = params.get("continuation-token")
+
+        # STEP 1: Get version information from origin.
+        s3_client_origin = boto3.client("s3")  # Initialize the S3 client
+        logging.info("Querying origin bucket with Prefix: %s and Delimiter: %s", prefix or "", delimiter)
+        origin_params = {"Bucket": bucket, "Prefix": prefix or ""}
+        if delimiter:
+            origin_params["Delimiter"] = delimiter
+        logging.info("Origin query parameters: %s", origin_params)
+        origin_resp = s3_client_origin.list_object_versions(**origin_params)
+        objects = {}  # key: object key, value: latest version dict.
+        if "Versions" in origin_resp:
+            for ver in origin_resp["Versions"]:
+                if ver["LastModified"] < START_TIME:
+                    ver["ItemType"] = "Version"
+                    key = ver["Key"]
+                    if key not in objects or ver["LastModified"] > objects[key]["LastModified"]:
+                        objects[key] = ver
+
+        # Process delete markers from origin
+        if "DeleteMarkers" in origin_resp:
+            for dm in origin_resp["DeleteMarkers"]:
+                logging.info("Processing delete marker from origin: %s", dm["Key"])
+                if dm["LastModified"] < START_TIME:
+                    dm["ItemType"] = "DeleteMarker"
+                    key = dm["Key"]
+                    if key not in objects or dm["LastModified"] > objects[key]["LastModified"]:
+                        objects[key] = dm
+
+        logging.info("Origin bucket items: %s", [obj["Key"] for obj in origin_resp.get("Versions", [])])
+
+        # STEP 2: Get version information from overlay.
+        s3_client_overlay = boto3.client(
+            "s3",
+            aws_access_key_id=overlay_credentials.access_key,
+            aws_secret_access_key=overlay_credentials.secret_key,
+            aws_session_token=overlay_credentials.token,
+            endpoint_url=OVERLAY_S3_URL  # Use the overlay S3 endpoint
+        )
+        overlay_prefix = f"{bucket}/{prefix}" if prefix else f"{bucket}/"
+        logging.info("Querying overlay bucket with Prefix: %s and Delimiter: %s", overlay_prefix, delimiter)
+        overlay_params = {"Bucket": OVERLAY_BUCKET, "Prefix": overlay_prefix}
+        if delimiter:
+            overlay_params["Delimiter"] = delimiter
+        logging.info("Overlay query parameters: %s", overlay_params)
+        overlay_resp = s3_client_overlay.list_object_versions(**overlay_params)
+        logging.info("Overlay response: %s", overlay_resp)
+        if "Versions" in overlay_resp:
+            for ver in overlay_resp["Versions"]:
+                ver["ItemType"] = "Version"
+                key_val = ver["Key"]
+                if key_val.startswith(f"{bucket}/"):
+                    key_val = key_val[len(bucket)+1:]
+                if key_val not in objects or ver["LastModified"] > objects[key_val]["LastModified"]:
+                    objects[key_val] = ver
+
+        # Process delete markers from overlay
+        if "DeleteMarkers" in overlay_resp:
+            for dm in overlay_resp["DeleteMarkers"]:
+                logging.info("Processing delete marker from overlay: %s", dm["Key"])
+                dm["ItemType"] = "DeleteMarker"
+                key_val = dm["Key"]
+                if key_val.startswith(f"{bucket}/"):
+                    key_val = key_val[len(bucket)+1:]
+                if key_val not in objects or dm["LastModified"] > objects[key_val]["LastModified"]:
+                    objects[key_val] = dm
+
+        logging.info("Overlay bucket items: %s", [obj["Key"] for obj in overlay_resp.get("Versions", [])])
+
+        # Collect common prefixes from origin
+        origin_common_prefixes = set()
+        if "CommonPrefixes" in origin_resp:
+            origin_common_prefixes.update(cp["Prefix"] for cp in origin_resp["CommonPrefixes"])
+
+        # Collect common prefixes from overlay
+        overlay_common_prefixes = set()
+        if "CommonPrefixes" in overlay_resp:
+            overlay_common_prefixes.update(cp["Prefix"] for cp in overlay_resp["CommonPrefixes"])
+
+        # Merge common prefixes
+        all_common_prefixes = origin_common_prefixes.union(overlay_common_prefixes)
+
+        # STEP 3: Build final list, omitting keys whose latest version is a delete marker.
+        final_objects = []
+        for key, ver in objects.items():
+            if ver["ItemType"] == "DeleteMarker":
+                logging.info("Excluding object with delete marker: %s", key)
+                continue
+            final_objects.append(ver)
+
+        # If a continuation token is provided, filter out objects with keys less than or equal to it.
+        if continuation_token:
+            final_objects = [obj for obj in final_objects if obj["Key"] > continuation_token]
+        # Sort objects by Key lexicographically to produce stable pagination.
+        final_objects.sort(key=lambda x: x["Key"])
+
+        # STEP 4: Paginate.
+        is_truncated = len(final_objects) > max_keys
+        paginated = final_objects[:max_keys]
+        next_token = paginated[-1]["Key"] if is_truncated else ""
+        # Avoid returning the same token as received.
+        if continuation_token and next_token == continuation_token:
+            next_token = ""
+
+        # STEP 5: Build XML per ListObjectsV2.
+        root = ET.Element("ListBucketResult")
+        name_elem = ET.SubElement(root, "Name")
+        name_elem.text = bucket
+        prefix_elem = ET.SubElement(root, "Prefix")
+        prefix_elem.text = prefix
+        keycount_elem = ET.SubElement(root, "KeyCount")
+        keycount_elem.text = str(len(paginated))
+        maxkeys_elem = ET.SubElement(root, "MaxKeys")
+        maxkeys_elem.text = str(max_keys)
+        trunc_elem = ET.SubElement(root, "IsTruncated")
+        trunc_elem.text = "true" if is_truncated else "false"
+        if is_truncated:
+            token_elem = ET.SubElement(root, "NextContinuationToken")
+            token_elem.text = next_token
+
+        # Handle delimiter (common prefixes) and adjust displayed keys.
+        delimiter = params.get("delimiter")
+        common_prefixes = set()
+        contents = []
+        for obj in paginated:
+            obj_key = obj["Key"]
+            # Remove the prefix (if provided) for display.
+            display_key = obj_key[len(prefix):] if prefix and obj_key.startswith(prefix) else obj_key
+            if delimiter:
+                pos = display_key.find(delimiter)
+                # If the delimiter is present...
+                if pos != -1:
+                    # Compute the common prefix (everything up to and including the delimiter).
+                    cp = display_key[:pos+1]
+                    common_prefixes.add((prefix if prefix else "") + cp)
+                    # If there are additional characters after the delimiter, group the key as a common prefix.
+                    # Otherwise, include the object as content.
+                    if len(display_key) > pos+1:
+                        continue
+            contents.append(obj)
+
+        # Add CommonPrefixes to the XML response
+        for cp in sorted(all_common_prefixes):
+            cp_elem = ET.SubElement(root, "CommonPrefixes")
+            prefix_elem_cp = ET.SubElement(cp_elem, "Prefix")
+            prefix_elem_cp.text = cp
+
+        # Add Contents to the XML response
+        for obj in paginated:
+            obj_key = obj["Key"]
+            # Exclude objects grouped under CommonPrefixes
+            if any(obj_key.startswith(cp) for cp in all_common_prefixes):
+                continue
+            cont_elem = ET.SubElement(root, "Contents")
+            key_elem = ET.SubElement(cont_elem, "Key")
+            key_elem.text = obj_key[len(prefix):] if prefix and obj_key.startswith(prefix) else obj_key
+            lastmod_elem = ET.SubElement(cont_elem, "LastModified")
+            lm = obj["LastModified"]
+            lastmod_elem.text = lm.isoformat() if isinstance(lm, datetime) else str(lm)
+            size_elem = ET.SubElement(cont_elem, "Size")
+            size_elem.text = str(obj.get("Size", 0))
+            storage_elem = ET.SubElement(cont_elem, "StorageClass")
+            storage_elem.text = obj.get("StorageClass", "STANDARD")
+
+        xml_response = ET.tostring(root, encoding="utf-8", method="xml")
+        return Response(content=xml_response, media_type="application/xml")
+
+    elif versions is not None:
+        # ----- ListObjectVersions logic (existing) -----
         s3_client_origin = boto3.client("s3")
-        origin_resp = s3_client_origin.list_object_versions(Bucket=bucket, Prefix=prefix)
-
+        origin_params = {"Bucket": bucket, "Prefix": prefix or ""}
+        origin_resp = s3_client_origin.list_object_versions(**origin_params)
         origin_items = []
         if "Versions" in origin_resp:
             for ver in origin_resp["Versions"]:
@@ -261,7 +434,6 @@ async def list_object_versions(bucket: str, prefix: str = "", versions: str = No
                     dm["ItemType"] = "DeleteMarker"
                     origin_items.append(dm)
 
-        # List object versions from the overlay bucket.
         overlay_bucket = OVERLAY_BUCKET
         overlay_prefix = f"{bucket}{prefix}" if prefix else bucket
         s3_client_overlay = boto3.client(
@@ -269,11 +441,11 @@ async def list_object_versions(bucket: str, prefix: str = "", versions: str = No
             aws_access_key_id=overlay_credentials.access_key,
             aws_secret_access_key=overlay_credentials.secret_key,
             aws_session_token=overlay_credentials.token,
-            endpoint_url=OVERLAY_S3_URL  # Use the overlay S3 endpoint
+            endpoint_url=OVERLAY_S3_URL
         )
-        overlay_resp = s3_client_overlay.list_object_versions(Bucket=overlay_bucket, Prefix=overlay_prefix)
-
-        merged_list = origin_items[:]  # start with all origin items
+        overlay_params = {"Bucket": OVERLAY_BUCKET, "Prefix": overlay_prefix}
+        overlay_resp = s3_client_overlay.list_object_versions(**overlay_params)
+        merged_list = origin_items[:]
         if "Versions" in overlay_resp:
             for over in overlay_resp["Versions"]:
                 over["ItemType"] = "Version"
@@ -283,14 +455,13 @@ async def list_object_versions(bucket: str, prefix: str = "", versions: str = No
                 dm["ItemType"] = "DeleteMarker"
                 merged_list.append(dm)
 
-        # Optionally sort by LastModified descending.
         merged_list.sort(key=lambda x: x["LastModified"], reverse=True)
-
         xml_response = merged_list_to_xml(merged_list, bucket, prefix)
         return Response(content=xml_response, media_type="application/xml")
 
-    # Fallback: if no 'versions' query parameter is passed, handle as a regular GET on the bucket.
-    return {"message": f"Regular GET for bucket: {bucket} with prefix: {prefix}"}
+    else:
+        # Fallback: Regular GET on bucket.
+        return {"message": f"Regular GET for bucket: {bucket} with prefix: {prefix}"}
 
 @app.api_route("/{full_path:path}", methods=["GET", "PUT", "DELETE", "HEAD"])
 async def proxy(full_path: str, request: Request):
