@@ -240,6 +240,8 @@ async def list_object_versions(bucket: str, prefix: str = "", versions: str = No
       - Origin: Lists object versions on the origin bucket filtered to those before START_TIME.
       - Overlay: Lists object versions in the overlay bucket (stored under "<bucket>/<key>") that override the origin.
 
+      - FIXME: Will probably have a meltdown if there are too many versions under prefix
+
     Otherwise, this route may be used for regular GET operations.
     """
     if versions is not None:
