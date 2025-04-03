@@ -10,11 +10,14 @@ services:
       - OVERLAY_BUCKET=overlay
       - ORIGIN_S3_URL=https://s3.amazonaws.com
       - AWS_REGION=us-east-1
-      - AWS_ACCESS_KEY_ID=overlay-access
-      - AWS_SECRET_ACCESS_KEY=overlay-secret
+      - OVERLAY_AWS_ACCESS_KEY_ID=overlay-access
+      - OVERLAY_AWS_SECRET_ACCESS_KEY=overlay-secret
+      - AWS_PROFILE=${AWS_PROFILE}
     depends_on:
       - minio-overlay
       - minio-init
+    volumes:
+      - "~/.aws:/root/.aws"
 
   minio-overlay:
     image: minio/minio

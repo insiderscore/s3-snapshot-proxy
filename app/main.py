@@ -25,23 +25,54 @@ OVERLAY_S3_URL = os.environ.get("OVERLAY_S3_URL", "http://overlay-s3.local")
 ORIGIN_S3_URL = os.environ.get("ORIGIN_S3_URL", "https://s3.amazonaws.com")
 OVERLAY_BUCKET = os.environ.get("OVERLAY_BUCKET", "overlay")
 
-# Unsigned client for origin S3
+# Create a boto3 session (using default configuration)
+session = boto3.Session()
+default_credentials = session.get_credentials()
+
+# For origin requests, always use the default credentials from boto3.
+origin_credentials = default_credentials
+
+# For overlay requests, check if environment variables prefixed with OVERLAY_AWS_ exist.
+overlay_access_key = os.environ.get("OVERLAY_AWS_ACCESS_KEY_ID")
+overlay_secret_key = os.environ.get("OVERLAY_AWS_SECRET_ACCESS_KEY")
+overlay_session_token = os.environ.get("OVERLAY_AWS_SESSION_TOKEN")
+
+if overlay_access_key and overlay_secret_key:
+    # Use overlay credentials from the environment.
+    # We mimic the structure of boto3's credentials by creating an object with access_key, secret_key, and token.
+    class OverlayCredentials:
+        pass
+    overlay_creds = OverlayCredentials()
+    overlay_creds.access_key = overlay_access_key
+    overlay_creds.secret_key = overlay_secret_key
+    overlay_creds.token = overlay_session_token
+    overlay_credentials = overlay_creds
+else:
+    # Fallback to the default boto3 session credentials.
+    overlay_credentials = default_credentials
+
+# Build AWS4Auth objects.
+origin_aws_auth = AWS4Auth(
+    access_id=origin_credentials.access_key,
+    secret_key=origin_credentials.secret_key,
+    region=os.environ.get("AWS_REGION", "us-east-1"),
+    service="s3",
+    security_token=origin_credentials.token
+)
+
+overlay_aws_auth = AWS4Auth(
+    access_id=overlay_credentials.access_key,
+    secret_key=overlay_credentials.secret_key,
+    region=os.environ.get("AWS_REGION", "us-east-1"),
+    service="s3",
+    security_token=overlay_credentials.token
+)
+
+# Unsigned client for origin S3 (or re-sign with origin_aws_auth when needed)
 client = httpx.AsyncClient(follow_redirects=True)
 
-# Signed client for overlay S3
-session = boto3.Session()
-credentials = session.get_credentials()
-if credentials is None:
-    logging.warning("No AWS credentials found; signed overlay requests may fail.")
-else:
-    aws_auth = AWS4Auth(
-        access_id=credentials.access_key,
-        secret_key=credentials.secret_key,
-        region=os.environ.get("AWS_REGION", "us-east-1"),
-        service="s3",
-        security_token=credentials.token
-    )
-    signed_client = httpx.AsyncClient(auth=aws_auth, follow_redirects=True)
+# Signed client for overlay S3 using overlay_aws_auth
+signed_client = httpx.AsyncClient(auth=overlay_aws_auth, follow_redirects=True)
 
 def rewrite_overlay_path(original_path: str) -> str:
     parts = original_path.strip("/").split("/", 1)
@@ -107,7 +138,9 @@ async def handle_precondition_failure(
     version_id = candidate["VersionId"]
     logging.info("Found version %s. Retrying origin request with version subresource.", version_id)
     origin_url = f"{ORIGIN_S3_URL}/{quote(full_path)}?versionId={version_id}"
-    new_response = await client.request(method, origin_url, headers=original_headers, content=body)
+    new_response = await client.request(
+         method, origin_url, headers=original_headers, auth=origin_aws_auth, content=body
+    )
     return new_response
 
 async def handle_get_head_fallback(
@@ -140,6 +173,9 @@ async def handle_get_head_fallback(
                     origin_headers["If-Unmodified-Since"] = proxy_start_str
 
             logging.info("Fallback to origin S3: %s %s", method, origin_url)
+            # It's not clear if we need to re-sign this request or not.
+            # In my testing, the aws s3 client library did not include
+            # If-Unmodified-Since in the signed headers. 
             new_response = await client.request(method, origin_url, headers=origin_headers, content=body)
             logging.info("Origin response status: %s", new_response.status_code)
             if new_response.status_code == 412:
