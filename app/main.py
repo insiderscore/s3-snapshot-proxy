@@ -51,13 +51,30 @@ def rewrite_overlay_path(original_path: str) -> str:
         bucket, key = parts[0], ""
     return f"{OVERLAY_BUCKET}/{bucket}/{key}"
 
+async def handle_delete_workaround(overlay_url: str, overlay_headers: dict, body: bytes) -> httpx.Response:
+    """
+    Handle DELETE requests using a facilitator object.
+    1. Create a zero-length facilitator object with the header x-rtwa-delete-marker-facilitator.
+    2. Then delete that object so only a delete marker remains.
+    """
+    facilitator_headers = overlay_headers.copy()
+    facilitator_headers["x-rtwa-delete-marker-facilitator"] = "true"
+    logging.info("Creating facilitator object for deletion marker workaround: PUT %s", overlay_url)
+    facilitator_response = await signed_client.put(overlay_url, headers=facilitator_headers, content=b"")
+    logging.info("Facilitator creation response status: %s", facilitator_response.status_code)
+    
+    logging.info("Deleting facilitator object: DELETE %s", overlay_url)
+    response = await signed_client.request("DELETE", overlay_url, headers=overlay_headers, content=body)
+    logging.info("Delete response (workaround) status: %s, headers: %s", response.status_code, dict(response.headers))
+    return response
+
 @app.api_route("/{full_path:path}", methods=["GET", "PUT", "DELETE", "HEAD"])
 async def proxy(full_path: str, request: Request):
     method = request.method
     original_headers = dict(request.headers)
     logging.info("Received %s request for %s", method, full_path)
     
-    # Use filtered headers for overlay S3 request
+    # Use filtered headers for overlay S3 request.
     overlay_headers = {
         k: v
         for k, v in original_headers.items()
@@ -68,25 +85,14 @@ async def proxy(full_path: str, request: Request):
     overlay_path = rewrite_overlay_path(full_path)
     overlay_url = f"{OVERLAY_S3_URL}/{quote(overlay_path)}"
     
-    # For DELETE requests, apply our facilitator workaround:
     if method == "DELETE":
-        # Create a zero-length facilitator object so that a deletion marker will be produced.
-        facilitator_headers = overlay_headers.copy()
-        facilitator_headers["x-rtwa-delete-marker-facilitator"] = "true"
-        logging.info("Creating facilitator object for deletion marker workaround: PUT %s", overlay_url)
-        facilitator_response = await signed_client.put(overlay_url, headers=facilitator_headers, content=b"")
-        logging.info("Facilitator creation response status: %s", facilitator_response.status_code)
-        
-        # Now delete that facilitator object, which should create a proper delete marker.
-        logging.info("Deleting facilitator object: DELETE %s", overlay_url)
-        response = await signed_client.request("DELETE", overlay_url, headers=overlay_headers, content=body)
-        logging.info("Delete response (workaround) status: %s, headers: %s", response.status_code, dict(response.headers))
+        response = await handle_delete_workaround(overlay_url, overlay_headers, body)
     else:
         logging.info("Sending overlay request: %s %s", method, overlay_url)
         response = await signed_client.request(method, overlay_url, headers=overlay_headers, content=body)
         logging.info("Overlay response status: %s, headers: %s", response.status_code, dict(response.headers))
     
-    # For GET or HEAD, if the overlay response includes the facilitator header, treat it as a deletion marker.
+    # For GET or HEAD, if the overlay response includes the facilitator header, treat it as a delete marker.
     if method in {"GET", "HEAD"} and response.headers.get("x-rtwa-delete-marker-facilitator", "false").lower() == "true":
         logging.info("Overlay response includes facilitator header; treating as delete marker (404)")
         response = httpx.Response(status_code=404, content=b"", headers=response.headers)
