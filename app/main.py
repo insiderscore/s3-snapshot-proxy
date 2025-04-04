@@ -834,6 +834,123 @@ async def list_objects_handler(bucket: str, request: Request, prefix: str = ""):
         # Fallback: Regular GET on bucket.
         return {"message": f"Regular GET for bucket: {bucket} with prefix: {prefix}"}
 
+async def handle_conditional_mutation(
+    method: str, full_path: str, original_headers: dict, body: bytes, response: httpx.Response
+) -> httpx.Response:
+    """
+    Handle conditional write (PUT) and delete (DELETE) requests that fail with 412 Precondition Failed.
+    
+    If the overlay returns 412 and the key doesn't exist in overlay:
+    1. Check if the condition would be satisfied against the origin object
+    2. If so, retry the request against overlay with modified conditions
+    """
+    if response.status_code != 412 or method not in {"PUT", "DELETE"}:
+        return response
+        
+    # Parse bucket and key from full_path
+    parts = full_path.strip("/").split("/", 1)
+    if len(parts) == 2:
+        bucket, key = parts
+    else:
+        bucket, key = parts[0], ""
+    
+    logging.info("Conditional mutation failed with 412. Checking if condition can be satisfied via origin.")
+    
+    # Check if object exists in overlay first (to avoid race conditions)
+    s3_client_overlay = get_overlay_s3_client()
+    try:
+        overlay_path = f"{bucket}/{key}"
+        s3_client_overlay.head_object(Bucket=OVERLAY_BUCKET, Key=overlay_path)
+        # If we get here, object exists in overlay - respect the 412 from overlay
+        logging.info("Object exists in overlay. Respecting 412 Precondition Failed.")
+        return response
+    except Exception:
+        # Object doesn't exist in overlay, check origin
+        pass
+    
+    # Check original request conditions against origin
+    s3_client_origin = get_origin_s3_client()
+    try:
+        # Get the origin object to check its metadata
+        origin_obj = s3_client_origin.head_object(Bucket=bucket, Key=key)
+        
+        # Extract relevant conditions from original headers
+        if_match = original_headers.get("if-match")
+        if_none_match = original_headers.get("if-none-match")
+        if_modified_since = original_headers.get("if-modified-since")
+        if_unmodified_since = original_headers.get("if-unmodified-since")
+        
+        # Check if the origin object satisfies these conditions
+        satisfied = True
+        
+        # Check ETag conditions
+        if if_match:
+            etags = [tag.strip(' "') for tag in if_match.split(",")]
+            origin_etag = origin_obj.get("ETag", "").strip('"')
+            if origin_etag not in etags and "*" not in etags:
+                satisfied = False
+                
+        if if_none_match and satisfied:
+            etags = [tag.strip(' "') for tag in if_none_match.split(",")]
+            origin_etag = origin_obj.get("ETag", "").strip('"')
+            if origin_etag in etags or "*" in etags:
+                satisfied = False
+        
+        # Check time-based conditions
+        if if_modified_since and satisfied:
+            try:
+                modified_since = datetime.strptime(
+                    if_modified_since, "%a, %d %b %Y %H:%M:%S GMT"
+                ).replace(tzinfo=timezone.utc)
+                last_modified = origin_obj.get("LastModified")
+                if last_modified <= modified_since:
+                    satisfied = False
+            except ValueError:
+                # Invalid date format
+                satisfied = False
+                
+        if if_unmodified_since and satisfied:
+            try:
+                unmodified_since = datetime.strptime(
+                    if_unmodified_since, "%a, %d %b %Y %H:%M:%S GMT"
+                ).replace(tzinfo=timezone.utc)
+                last_modified = origin_obj.get("LastModified")
+                if last_modified > unmodified_since:
+                    satisfied = False
+            except ValueError:
+                # Invalid date format
+                satisfied = False
+        
+        # If origin would satisfy the conditions, retry against overlay with simplified condition
+        if satisfied:
+            logging.info("Origin object satisfies the original conditions. Retrying with If-None-Match: *")
+            # Create new headers without the original conditions
+            modified_headers = {k: v for k, v in original_headers.items() 
+                               if k.lower() not in {"if-match", "if-none-match", 
+                                                   "if-modified-since", "if-unmodified-since"}}
+            # Add condition that will allow write if object doesn't exist in overlay
+            modified_headers["If-None-Match"] = "*"
+            
+            overlay_path = rewrite_overlay_path(full_path)
+            overlay_url = f"{OVERLAY_S3_URL}/{quote(overlay_path)}"
+            
+            if method == "DELETE":
+                new_response = await handle_delete_workaround(overlay_url, modified_headers, body)
+            else:
+                new_response = await signed_client.request(
+                    method, overlay_url, headers=modified_headers, content=body
+                )
+            
+            logging.info("Conditional retry status: %s", new_response.status_code)
+            return new_response
+        
+    except Exception as e:
+        # Object doesn't exist in origin or other error
+        logging.info("Error checking origin object: %s", str(e))
+    
+    # Default: return the original 412 response
+    return response
+
 @app.api_route("/{full_path:path}", methods=["GET", "PUT", "DELETE", "HEAD"])
 async def proxy(full_path: str, request: Request):
     method = request.method
@@ -861,8 +978,13 @@ async def proxy(full_path: str, request: Request):
         logging.info("Overlay response includes facilitator header; treating as delete marker (404)")
         response = httpx.Response(status_code=404, content=b"", headers=response.headers)
     
-    # Fallback to origin S3 if applicable, including 412 precondition handling.
-    response = await handle_get_head_fallback(method, full_path, original_headers, body, response)
+    # Handle conditional mutation failures (412 Precondition Failed)
+    if response.status_code == 412 and method in {"PUT", "DELETE"}:
+        response = await handle_conditional_mutation(method, full_path, original_headers, body, response)
+    
+    # Fallback to origin S3 for GET/HEAD if needed
+    if method in {"GET", "HEAD"}:
+        response = await handle_get_head_fallback(method, full_path, original_headers, body, response)
     
     return Response(
         content=response.content,
