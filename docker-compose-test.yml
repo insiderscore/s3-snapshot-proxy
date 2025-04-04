@@ -30,13 +30,17 @@ services:
 
   minio-overlay:
     image: minio/minio
-    command: server /data --console-address ":9001"
+    command: server /data --console-address ":9001" --quiet
     ports:
       - "9001:9001"
       - "9000:9000"
     environment:
       MINIO_ACCESS_KEY: overlay-access
       MINIO_SECRET_KEY: overlay-secret
+      MINIO_STORAGE_CLASS_STANDARD: EC:0
+      MINIO_DISK_USAGE_CRAWL: "off"
+    volumes:
+      - /dev/shm/minio-overlay:/data # Use in-memory storage for tests
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/ready"]
       interval: 1s # Check every second (was 5s)
@@ -46,12 +50,16 @@ services:
 
   minio-origin:
     image: minio/minio
-    command: server /data --console-address ":9002"
+    command: server /data --console-address ":9002" --quiet
     ports:
       - "9002:9000"
     environment:
       MINIO_ACCESS_KEY: origin-access
       MINIO_SECRET_KEY: origin-secret
+      MINIO_STORAGE_CLASS_STANDARD: EC:0
+      MINIO_DISK_USAGE_CRAWL: "off"
+    volumes:
+      - /dev/shm/minio-origin:/data # Use in-memory storage for tests
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/ready"]
       interval: 1s # Check every second (was 5s)
