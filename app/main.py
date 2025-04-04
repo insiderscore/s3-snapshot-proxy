@@ -252,7 +252,7 @@ async def list_objects_handler(bucket: str, request: Request, prefix: str = ""):
         max_keys = int(params.get("max-keys", "1000"))
         continuation_token = params.get("continuation-token")
 
-        # STEP 1: Get current objects from origin using list_objects_v2
+        # STEP 1: Get ALL versions from origin to find the latest version before START_TIME
         s3_client_origin = boto3.client(
             "s3",
             aws_access_key_id=origin_credentials.access_key,
@@ -260,30 +260,53 @@ async def list_objects_handler(bucket: str, request: Request, prefix: str = ""):
             aws_session_token=origin_credentials.token,
             endpoint_url=ORIGIN_S3_URL
         )
-        logging.info("Querying origin bucket with Prefix: %s and Delimiter: %s", prefix or "", delimiter)
+        logging.info("Querying origin versions with Prefix: %s", prefix or "")
         origin_params = {"Bucket": bucket, "Prefix": prefix or ""}
         if delimiter:
             origin_params["Delimiter"] = delimiter
-        if continuation_token:
-            origin_params["ContinuationToken"] = continuation_token
-        if max_keys:
-            origin_params["MaxKeys"] = max_keys
+        # Note: We can't use continuation_token here since list_object_versions uses different pagination
             
         logging.info("Origin query parameters: %s", origin_params)
-        origin_resp = s3_client_origin.list_objects_v2(**origin_params)
+        
+        # Paginate through all object versions
+        is_truncated = True
+        key_marker = None
+        version_id_marker = None
+
+        while is_truncated:
+            origin_params = {"Bucket": bucket, "Prefix": prefix or ""}
+            if key_marker:
+                origin_params["KeyMarker"] = key_marker
+                origin_params["VersionIdMarker"] = version_id_marker
+                
+            origin_resp = s3_client_origin.list_object_versions(**origin_params)
+            
+            # Process this batch of versions...
+            
+            # Update markers for next iteration
+            is_truncated = origin_resp.get('IsTruncated', False)
+            if is_truncated:
+                key_marker = origin_resp.get('NextKeyMarker')
+                version_id_marker = origin_resp.get('NextVersionIdMarker')
         
         # Initialize dictionaries to track objects and common prefixes
-        objects = {}  # key: object key, value: object dict
+        objects = {}  # key: object key, value: latest version before START_TIME
         
-        # Process objects from origin
-        if "Contents" in origin_resp:
-            for obj in origin_resp["Contents"]:
-                # We need to check if this object was created before START_TIME
-                # Since list_objects_v2 doesn't provide version info, we'll need
-                # to use the LastModified timestamp
-                if "LastModified" in obj and obj["LastModified"] < START_TIME:
-                    key = obj["Key"]
-                    objects[key] = obj
+        # Process versions from origin, keeping only the latest version before START_TIME for each key
+        if "Versions" in origin_resp:
+            for ver in origin_resp["Versions"]:
+                key = ver["Key"]
+                # Only consider versions from before START_TIME
+                if ver["LastModified"] < START_TIME:
+                    # If we haven't seen this key before, or this version is newer than what we have
+                    if key not in objects or ver["LastModified"] > objects[key]["LastModified"]:
+                        objects[key] = {
+                            "Key": key,
+                            "LastModified": ver["LastModified"],
+                            "ETag": ver.get("ETag", ""),
+                            "Size": ver.get("Size", 0),
+                            "StorageClass": ver.get("StorageClass", "STANDARD")
+                        }
         
         # Process common prefixes from origin
         origin_common_prefixes = []
@@ -299,11 +322,11 @@ async def list_objects_handler(bucket: str, request: Request, prefix: str = ""):
             endpoint_url=OVERLAY_S3_URL
         )
         
-        overlay_prefix = f"{bucket}/{prefix}"
-        if not overlay_prefix.endswith("/"):
-            overlay_prefix += "/"
+        overlay_prefix = f"{bucket}/"
+        if prefix:
+            overlay_prefix = f"{bucket}/{prefix}"
             
-        logging.info("Querying overlay bucket with Prefix: %s and Delimiter: %s", overlay_prefix, delimiter)
+        logging.info("Querying overlay bucket with Prefix: %s", overlay_prefix)
         overlay_params = {"Bucket": OVERLAY_BUCKET, "Prefix": overlay_prefix}
         if delimiter:
             overlay_params["Delimiter"] = delimiter
@@ -316,7 +339,7 @@ async def list_objects_handler(bucket: str, request: Request, prefix: str = ""):
             for ver in overlay_resp["Versions"]:
                 key_val = ver["Key"]
                 if key_val.startswith(f"{bucket}/"):
-                    key_val = key_val[len(bucket)+1:]
+                    key_val = key_val[len(f"{bucket}/"):]
                 
                 # Add new objects from overlay or replace origin objects
                 objects[key_val] = {
@@ -332,7 +355,7 @@ async def list_objects_handler(bucket: str, request: Request, prefix: str = ""):
             for dm in overlay_resp["DeleteMarkers"]:
                 key_val = dm["Key"]
                 if key_val.startswith(f"{bucket}/"):
-                    key_val = key_val[len(bucket)+1:]
+                    key_val = key_val[len(f"{bucket}/"):]
                 
                 # Remove objects that have delete markers
                 if key_val in objects:
@@ -344,7 +367,7 @@ async def list_objects_handler(bucket: str, request: Request, prefix: str = ""):
             for cp in overlay_resp["CommonPrefixes"]:
                 prefix_val = cp["Prefix"]
                 if prefix_val.startswith(f"{bucket}/"):
-                    prefix_val = prefix_val[len(bucket)+1:]
+                    prefix_val = prefix_val[len(f"{bucket}/"):]
                 overlay_common_prefixes.append({"Prefix": prefix_val})
         
         # Merge common prefixes
@@ -356,7 +379,17 @@ async def list_objects_handler(bucket: str, request: Request, prefix: str = ""):
         # Sort objects by Key lexicographically (required for ListObjectsV2)
         final_objects.sort(key=lambda x: x["Key"])
         
-        # Paginate results
+        # Handle pagination
+        if continuation_token:
+            # Find start position based on continuation token
+            start_pos = 0
+            for i, obj in enumerate(final_objects):
+                if obj["Key"] > continuation_token:
+                    start_pos = i
+                    break
+            final_objects = final_objects[start_pos:]
+        
+        # Limit results
         is_truncated = len(final_objects) > max_keys
         paginated = final_objects[:max_keys]
         next_token = paginated[-1]["Key"] if is_truncated and paginated else ""
