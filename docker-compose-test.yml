@@ -39,14 +39,14 @@ services:
       MINIO_SECRET_KEY: overlay-secret
       MINIO_STORAGE_CLASS_STANDARD: EC:0
       MINIO_DISK_USAGE_CRAWL: "off"
-    volumes:
-      - /dev/shm/minio-overlay:/data # Use in-memory storage for tests
+    tmpfs:
+      - /data:exec,size=1g
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/ready"]
-      interval: 1s # Check every second (was 5s)
-      timeout: 1s # Fail if check takes longer than 1s (was 3s)
-      retries: 2 # Only need 2 successful checks (was 3)
-      start_period: 1s # MinIO starts quickly, so short start period
+      interval: 1s
+      timeout: 1s
+      retries: 2
+      start_period: 1s
 
   minio-origin:
     image: minio/minio
@@ -58,14 +58,14 @@ services:
       MINIO_SECRET_KEY: origin-secret
       MINIO_STORAGE_CLASS_STANDARD: EC:0
       MINIO_DISK_USAGE_CRAWL: "off"
-    volumes:
-      - /dev/shm/minio-origin:/data # Use in-memory storage for tests
+    tmpfs:
+      - /data:exec,size=1g
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/ready"]
-      interval: 1s # Check every second (was 5s)
-      timeout: 1s # Fail if check takes longer than 1s (was 3s)
-      retries: 2 # Only need 2 successful checks (was 3)
-      start_period: 1s # MinIO starts quickly, so short start period
+      interval: 1s
+      timeout: 1s
+      retries: 2
+      start_period: 1s
 
   overlay-bucket-init:
     image: minio/mc
