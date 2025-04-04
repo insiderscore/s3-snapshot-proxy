@@ -1,5 +1,12 @@
 FROM python:3.11-slim AS base
 
+
+# Install curl and other dependencies
+RUN apt-get update && \
+    apt-get install -y curl && \
+    apt-get clean && \
+    rm -rf /var/lib/apt/lists/*
+
 WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
@@ -14,9 +21,9 @@ ENTRYPOINT ["sh", "/app/tests/wait-for-buckets.sh"]
 HEALTHCHECK --interval=5s --timeout=3s --retries=3 CMD test -f /tmp/buckets-ready || exit 1
 
 # Test target
-FROM python:3.11-slim AS test
+FROM base AS test
 WORKDIR /app
-# Install dependencies
 COPY tests/requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
+
 COPY tests/ ./tests

@@ -11,17 +11,22 @@ services:
       - OVERLAY_S3_URL=http://minio-overlay:9000
       - OVERLAY_BUCKET=overlay
       - ORIGIN_S3_URL=http://minio-origin:9000
-      #      - AWS_REGION=us-east-1
-      - OVERLAY_AWS_ACCESS_KEY_ID=overlay-access
-      - OVERLAY_AWS_SECRET_ACCESS_KEY=overlay-secret
       - AWS_ACCESS_KEY_ID=origin-access
       - AWS_SECRET_ACCESS_KEY=origin-secret
+      - OVERLAY_AWS_ACCESS_KEY_ID=overlay-access
+      - OVERLAY_AWS_SECRET_ACCESS_KEY=overlay-secret
     depends_on:
-      - minio-overlay
-      - minio-overlay-init
-      - minio-origin-init
-    volumes:
-      - "~/.aws:/root/.aws"
+      origin-populator:
+        condition: service_completed_successfully
+      overlay-bucket-init:
+        condition: service_completed_successfully
+    entrypoint: "uvicorn app.main:app --host 0.0.0.0 --port 9000 --log-level debug"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/health"]
+      interval: 1s # Check every second (was 5s)
+      timeout: 1s # Fail if check takes longer than 1s (was 3s)
+      retries: 2 # Only need 2 successful checks (was 5)
+      start_period: 2s # Give 2s for initial startup
 
   minio-overlay:
     image: minio/minio
@@ -32,16 +37,12 @@ services:
     environment:
       MINIO_ACCESS_KEY: overlay-access
       MINIO_SECRET_KEY: overlay-secret
-
-  minio-overlay-init:
-    image: minio/mc
-    depends_on:
-      - minio-overlay
-    entrypoint: >
-      /bin/sh -c "
-      until mc alias set overlay http://minio-overlay:9000 overlay-access overlay-secret; do sleep 1; done;
-      mc mb overlay/overlay || true;
-      mc version enable overlay/overlay;"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/ready"]
+      interval: 1s # Check every second (was 5s)
+      timeout: 1s # Fail if check takes longer than 1s (was 3s)
+      retries: 2 # Only need 2 successful checks (was 3)
+      start_period: 1s # MinIO starts quickly, so short start period
 
   minio-origin:
     image: minio/minio
@@ -51,37 +52,50 @@ services:
     environment:
       MINIO_ACCESS_KEY: origin-access
       MINIO_SECRET_KEY: origin-secret
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/ready"]
+      interval: 1s # Check every second (was 5s)
+      timeout: 1s # Fail if check takes longer than 1s (was 3s)
+      retries: 2 # Only need 2 successful checks (was 3)
+      start_period: 1s # MinIO starts quickly, so short start period
 
-  minio-origin-init:
+  overlay-bucket-init:
     image: minio/mc
     depends_on:
-      - minio-origin
-    entrypoint: >
-      /bin/sh -c "
-      until mc alias set origin http://minio-origin:9000 origin-access origin-secret; do sleep 1; done;
-      mc mb origin/origin-bucket1 || true;
-      mc mb origin/origin-bucket2 || true;
-      mc mb origin/origin-bucket3 || true;
-      mc version enable origin/origin-bucket1;
-      mc version enable origin/origin-bucket2;
-      mc version enable origin/origin-bucket3;"
+      minio-overlay:
+        condition: service_healthy
+    volumes:
+      - ./init_overlay_bucket.sh:/init_overlay_bucket.sh
+    entrypoint: "/init_overlay_bucket.sh"
 
-  minio-waiter:
+  origin-buckets-init:
+    image: minio/mc
+    depends_on:
+      minio-origin:
+        condition: service_healthy
+    volumes:
+      - ./init_origin_buckets.sh:/init_origin_buckets.sh
+    entrypoint: "/init_origin_buckets.sh"
+
+  origin-populator:
     build:
       context: .
-      target: minio-waiter
+      target: test
     depends_on:
-      - minio-overlay
-      - minio-origin
+      origin-buckets-init:
+        condition: service_completed_successfully
+    working_dir: /app
+    environment:
+      - PYTHONPATH=/app
+      - SCALE_FACTOR=${SCALE_FACTOR:-100}
+    entrypoint: "python /app/tests/populate_origin.py"
 
   test-runner:
     build:
       context: .
       target: test
     depends_on:
-      - minio-waiter
-      - s3proxy
+      s3proxy:
+        condition: service_healthy
     working_dir: /app/tests
-    entrypoint: >
-      /bin/sh -c "
-      pytest test_regression.py --disable-warnings --capture=no --scale-factor=100;"
+    entrypoint: "pytest test_regression.py --disable-warnings --capture=no --scale-factor=100"
