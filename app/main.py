@@ -311,6 +311,281 @@ def merged_list_to_xml(merged_list, bucket, prefix):
 
     return ET.tostring(root, encoding="utf-8", method="xml")
 
+# Factor out the S3 client creation
+def get_origin_s3_client():
+    """Create and return an S3 client for origin access"""
+    return boto3.client(
+        "s3",
+        aws_access_key_id=origin_credentials.access_key,
+        aws_secret_access_key=origin_credentials.secret_key,
+        aws_session_token=origin_credentials.token if hasattr(origin_credentials, 'token') else None,
+        endpoint_url=ORIGIN_S3_URL
+    )
+
+def get_overlay_s3_client():
+    """Create and return an S3 client for overlay access"""
+    return boto3.client(
+        "s3",
+        aws_access_key_id=overlay_credentials.access_key,
+        aws_secret_access_key=overlay_credentials.secret_key,
+        aws_session_token=overlay_credentials.token if hasattr(overlay_credentials, 'token') else None,
+        endpoint_url=OVERLAY_S3_URL
+    )
+
+# Extract version filtering into a utility function
+def filter_version_by_start_time(version, start_time):
+    """Return True if this version is relevant (created before START_TIME)"""
+    return version["LastModified"] < start_time
+
+# Handle the versions logic
+def process_list_versions(bucket, prefix, delimiter, key_marker, version_id_marker, max_keys):
+    """
+    Process ListObjectVersions request by merging results from origin and overlay
+    with proper pagination and filtering
+    """
+    # STEP 1: Get versions from origin that were created before START_TIME
+    s3_client_origin = get_origin_s3_client()
+    origin_versions = []
+    origin_delete_markers = []
+    origin_common_prefixes = set()
+    
+    # Paginate through all object versions from origin
+    is_truncated = True
+    origin_key_marker = key_marker
+    origin_version_id_marker = version_id_marker
+    
+    while is_truncated:
+        origin_params = {
+            "Bucket": bucket, 
+            "Prefix": prefix or "",
+            "MaxKeys": 1000  # Use maximum allowed for efficiency
+        }
+        
+        if delimiter:
+            origin_params["Delimiter"] = delimiter
+            
+        if origin_key_marker:
+            origin_params["KeyMarker"] = origin_key_marker
+            if origin_version_id_marker:
+                origin_params["VersionIdMarker"] = origin_version_id_marker
+        
+        logging.info(f"Origin ListObjectVersions params: {origin_params}")
+        origin_resp = s3_client_origin.list_object_versions(**origin_params)
+        
+        # Process versions that existed before START_TIME
+        if "Versions" in origin_resp:
+            for ver in origin_resp["Versions"]:
+                if filter_version_by_start_time(ver, START_TIME):
+                    # Annotate with source and add ItemType for XML generation
+                    ver["Source"] = "origin"
+                    ver["ItemType"] = "Version"
+                    origin_versions.append(ver)
+        
+        # Process delete markers that existed before START_TIME
+        if "DeleteMarkers" in origin_resp:
+            for dm in origin_resp["DeleteMarkers"]:
+                if filter_version_by_start_time(dm, START_TIME):
+                    dm["Source"] = "origin"
+                    dm["ItemType"] = "DeleteMarker"
+                    origin_delete_markers.append(dm)
+                    
+        # Process common prefixes if delimiter is specified
+        if "CommonPrefixes" in origin_resp:
+            for cp in origin_resp["CommonPrefixes"]:
+                origin_common_prefixes.add(cp["Prefix"])
+        
+        # Update markers for next iteration
+        is_truncated = origin_resp.get('IsTruncated', False)
+        if is_truncated:
+            origin_key_marker = origin_resp.get('NextKeyMarker')
+            origin_version_id_marker = origin_resp.get('NextVersionIdMarker')
+        else:
+            break
+    
+    # STEP 2: Get versions from overlay bucket
+    s3_client_overlay = get_overlay_s3_client()
+    overlay_versions = []
+    overlay_delete_markers = []
+    overlay_common_prefixes = set()
+    
+    # Calculate overlay prefix
+    overlay_prefix = f"{bucket}/"
+    if prefix:
+        overlay_prefix = f"{bucket}/{prefix}"
+    
+    # Paginate through overlay versions
+    is_truncated = True
+    overlay_key_marker = None
+    overlay_version_id_marker = None
+    
+    if key_marker:
+        # Need to transform the key marker for overlay
+        overlay_key_marker = f"{bucket}/{key_marker}"
+    
+    while is_truncated:
+        overlay_params = {
+            "Bucket": OVERLAY_BUCKET,
+            "Prefix": overlay_prefix,
+            "MaxKeys": 1000
+        }
+        
+        if delimiter:
+            # Need to adjust delimiter handling for the overlay bucket
+            # because keys are prefixed with the bucket name
+            overlay_params["Delimiter"] = delimiter
+        
+        if overlay_key_marker:
+            overlay_params["KeyMarker"] = overlay_key_marker
+            if overlay_version_id_marker:
+                overlay_params["VersionIdMarker"] = overlay_version_id_marker
+        
+        logging.info(f"Overlay ListObjectVersions params: {overlay_params}")
+        overlay_resp = s3_client_overlay.list_object_versions(**overlay_params)
+        
+        # Process overlay versions
+        if "Versions" in overlay_resp:
+            for ver in overlay_resp["Versions"]:
+                # Strip bucket prefix from key for comparison
+                original_key = ver["Key"]
+                if original_key.startswith(f"{bucket}/"):
+                    ver["Key"] = original_key[len(f"{bucket}/"):]
+                    ver["Source"] = "overlay"
+                    ver["ItemType"] = "Version"
+                    ver["OriginalKey"] = original_key  # Keep original for reference
+                    overlay_versions.append(ver)
+        
+        # Process overlay delete markers
+        if "DeleteMarkers" in overlay_resp:
+            for dm in overlay_resp["DeleteMarkers"]:
+                original_key = dm["Key"]
+                if original_key.startswith(f"{bucket}/"):
+                    dm["Key"] = original_key[len(f"{bucket}/"):]
+                    dm["Source"] = "overlay"
+                    dm["ItemType"] = "DeleteMarker"
+                    dm["OriginalKey"] = original_key
+                    overlay_delete_markers.append(dm)
+        
+        # Process overlay common prefixes
+        if "CommonPrefixes" in overlay_resp:
+            for cp in overlay_resp["CommonPrefixes"]:
+                prefix_val = cp["Prefix"]
+                if prefix_val.startswith(f"{bucket}/"):
+                    # Strip the bucket prefix for consistency
+                    adjusted_prefix = prefix_val[len(f"{bucket}/"):]
+                    overlay_common_prefixes.add(adjusted_prefix)
+        
+        # Update markers for next iteration
+        is_truncated = overlay_resp.get('IsTruncated', False)
+        if is_truncated:
+            overlay_key_marker = overlay_resp.get('NextKeyMarker')
+            overlay_version_id_marker = overlay_resp.get('NextVersionIdMarker')
+        else:
+            break
+    
+    # STEP 3: Merge results from origin and overlay
+    # Create a dictionary to track the latest versions for each key
+    all_versions = origin_versions + overlay_versions
+    all_delete_markers = origin_delete_markers + overlay_delete_markers
+    
+    # Merge common prefixes
+    all_common_prefixes = origin_common_prefixes.union(overlay_common_prefixes)
+    
+    # Build a comprehensive version history for each key
+    key_versions = defaultdict(list)
+    
+    # Add all versions
+    for ver in all_versions:
+        key = ver["Key"]
+        key_versions[key].append(ver)
+    
+    # Add all delete markers
+    for dm in all_delete_markers:
+        key = dm["Key"]
+        key_versions[key].append(dm)
+    
+    # For each key, sort versions by LastModified (newest first)
+    merged_list = []
+    for key, versions in key_versions.items():
+        versions.sort(key=lambda x: x["LastModified"], reverse=True)
+        
+        # Mark the newest version as IsLatest
+        if versions:
+            versions[0]["IsLatest"] = True
+            for v in versions[1:]:
+                v["IsLatest"] = False
+            
+        merged_list.extend(versions)
+    
+    # Sort the entire merged list by Key and then by LastModified (newest first)
+    merged_list.sort(key=lambda x: (x["Key"], -x["LastModified"].timestamp() if isinstance(x["LastModified"], datetime) else 0))
+    
+    # STEP 4: Handle pagination
+    if key_marker:
+        # Find the position after key_marker to start returning results
+        start_pos = 0
+        for i, item in enumerate(merged_list):
+            if item["Key"] > key_marker or (item["Key"] == key_marker and item.get("VersionId", "") > version_id_marker):
+                start_pos = i
+                break
+        merged_list = merged_list[start_pos:]
+    
+    # Limit results to max_keys
+    is_truncated = len(merged_list) > max_keys
+    paginated_list = merged_list[:max_keys]
+    
+    # Get next markers if truncated
+    next_key_marker = ""
+    next_version_id_marker = ""
+    if is_truncated and paginated_list:
+        last_item = paginated_list[-1]
+        next_key_marker = last_item["Key"]
+        next_version_id_marker = last_item.get("VersionId", "")
+    
+    # STEP 5: Generate XML response
+    root = ET.Element("ListVersionsResult")
+    
+    # Add required elements
+    ET.SubElement(root, "Name").text = bucket
+    ET.SubElement(root, "Prefix").text = prefix or ""
+    if key_marker:
+        ET.SubElement(root, "KeyMarker").text = key_marker
+    if version_id_marker:
+        ET.SubElement(root, "VersionIdMarker").text = version_id_marker
+    if is_truncated:
+        ET.SubElement(root, "NextKeyMarker").text = next_key_marker
+        ET.SubElement(root, "NextVersionIdMarker").text = next_version_id_marker
+    
+    ET.SubElement(root, "MaxKeys").text = str(max_keys)
+    ET.SubElement(root, "IsTruncated").text = "true" if is_truncated else "false"
+    
+    if delimiter:
+        ET.SubElement(root, "Delimiter").text = delimiter
+    
+    # Add CommonPrefixes
+    for prefix_val in sorted(all_common_prefixes):
+        cp_elem = ET.SubElement(root, "CommonPrefixes")
+        ET.SubElement(cp_elem, "Prefix").text = prefix_val
+    
+    # Add Versions and DeleteMarkers
+    for item in paginated_list:
+        if item["ItemType"] == "Version":
+            ver_elem = ET.SubElement(root, "Version")
+            ET.SubElement(ver_elem, "Key").text = item["Key"]
+            ET.SubElement(ver_elem, "VersionId").text = item.get("VersionId", "")
+            ET.SubElement(ver_elem, "IsLatest").text = "true" if item.get("IsLatest", False) else "false"
+            ET.SubElement(ver_elem, "LastModified").text = item["LastModified"].isoformat() if isinstance(item["LastModified"], datetime) else str(item["LastModified"])
+            ET.SubElement(ver_elem, "Size").text = str(item.get("Size", 0))
+            ET.SubElement(ver_elem, "ETag").text = item.get("ETag", "")
+            ET.SubElement(ver_elem, "StorageClass").text = item.get("StorageClass", "STANDARD")
+        else:  # DeleteMarker
+            dm_elem = ET.SubElement(root, "DeleteMarker")
+            ET.SubElement(dm_elem, "Key").text = item["Key"]
+            ET.SubElement(dm_elem, "VersionId").text = item.get("VersionId", "")
+            ET.SubElement(dm_elem, "IsLatest").text = "true" if item.get("IsLatest", False) else "false"
+            ET.SubElement(dm_elem, "LastModified").text = item["LastModified"].isoformat() if isinstance(item["LastModified"], datetime) else str(item["LastModified"])
+    
+    return ET.tostring(root, encoding="utf-8", method="xml")
+
 @app.get("/{bucket}")
 async def list_objects_handler(bucket: str, request: Request, prefix: str = ""):
     """
@@ -324,7 +599,6 @@ async def list_objects_handler(bucket: str, request: Request, prefix: str = ""):
     list_type = params.get("list-type")
     versions = params.get("versions")
     delimiter = params.get("delimiter")
-
 
     if list_type == "2":
         # ----- ListObjectsV2 logic -----
@@ -518,47 +792,22 @@ async def list_objects_handler(bucket: str, request: Request, prefix: str = ""):
         return Response(content=xml_response, media_type="application/xml")
 
     elif versions is not None:
-        # ----- ListObjectVersions logic (existing) -----
-        s3_client_origin = boto3.client("s3")
-        origin_params = {"Bucket": bucket, "Prefix": prefix or ""}
-        origin_resp = s3_client_origin.list_object_versions(**origin_params)
-        origin_items = []
-        if "Versions" in origin_resp:
-            for ver in origin_resp["Versions"]:
-                if ver["LastModified"] < START_TIME:
-                    ver["ItemType"] = "Version"
-                    origin_items.append(ver)
-        if "DeleteMarkers" in origin_resp:
-            for dm in origin_resp["DeleteMarkers"]:
-                if dm["LastModified"] < START_TIME:
-                    dm["ItemType"] = "DeleteMarker"
-                    origin_items.append(dm)
-
-        overlay_bucket = OVERLAY_BUCKET
-        overlay_prefix = f"{bucket}{prefix}" if prefix else bucket
-        s3_client_overlay = boto3.client(
-            "s3",
-            aws_access_key_id=overlay_credentials.access_key,
-            aws_secret_access_key=overlay_credentials.secret_key,
-            aws_session_token=overlay_credentials.token,
-            endpoint_url=OVERLAY_S3_URL
+        # ----- ListObjectVersions logic (improved) -----
+        max_keys = int(params.get("max-keys", "1000"))
+        key_marker = params.get("key-marker")
+        version_id_marker = params.get("version-id-marker")
+        
+        xml_response = process_list_versions(
+            bucket=bucket,
+            prefix=prefix,
+            delimiter=delimiter,
+            key_marker=key_marker,
+            version_id_marker=version_id_marker,
+            max_keys=max_keys
         )
-        overlay_params = {"Bucket": OVERLAY_BUCKET, "Prefix": overlay_prefix}
-        overlay_resp = s3_client_overlay.list_object_versions(**overlay_params)
-        merged_list = origin_items[:]
-        if "Versions" in overlay_resp:
-            for over in overlay_resp["Versions"]:
-                over["ItemType"] = "Version"
-                merged_list.append(over)
-        if "DeleteMarkers" in overlay_resp:
-            for dm in overlay_resp["DeleteMarkers"]:
-                dm["ItemType"] = "DeleteMarker"
-                merged_list.append(dm)
-
-        merged_list.sort(key=lambda x: x["LastModified"], reverse=True)
-        xml_response = merged_list_to_xml(merged_list, bucket, prefix)
+        
         return Response(content=xml_response, media_type="application/xml")
-
+    
     else:
         # Fallback: Regular GET on bucket.
         return {"message": f"Regular GET for bucket: {bucket} with prefix: {prefix}"}
