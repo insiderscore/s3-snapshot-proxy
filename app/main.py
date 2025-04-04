@@ -199,7 +199,8 @@ async def handle_precondition_failure(
         bucket, key = parts[0], ""
 
     logging.info("Received 412. Listing object versions for bucket: %s, key: %s", bucket, key)
-    s3_client = boto3.client("s3")
+    # Use the proper client with correct credentials and endpoint
+    s3_client = get_origin_s3_client()
     versions_response = s3_client.list_object_versions(Bucket=bucket, Prefix=key)
     
     candidate = None
