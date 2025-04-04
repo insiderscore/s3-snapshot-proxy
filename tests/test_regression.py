@@ -189,6 +189,9 @@ def test_proxy(scale_factor):
     print("\n=== Testing Conditional Requests ===\n")
     test_conditional_requests(scale_factor)
 
+    # Add our new point-in-time test
+    test_point_in_time_conditional()
+
 def test_conditional_requests(scale_factor):
     """Test conditional requests against the S3 overlay proxy"""
     print("Testing conditional request handling...")
@@ -521,6 +524,119 @@ def test_conditional_requests(scale_factor):
     # headers that our proxy might not fully implement yet
 
     print("All conditional request tests passed!")
+
+def test_point_in_time_conditional():
+    """Test that conditional operations respect the point-in-time view based on START_TIME"""
+    print("\n=== Testing Point-in-Time Conditional Operations ===\n")
+    
+    # Set up clients
+    origin_client = boto3.client(
+        "s3",
+        endpoint_url="http://minio-origin:9000",
+        aws_access_key_id="origin-access",
+        aws_secret_access_key="origin-secret"
+    )
+    proxy_client = boto3.client(
+        "s3",
+        endpoint_url="http://s3proxy:9000",
+        aws_access_key_id="origin-access",
+        aws_secret_access_key="origin-secret"
+    )
+    
+    # Get the proxy's START_TIME
+    health_url = f"http://s3proxy:9000/health"
+    response = requests.get(health_url)
+    health_data = response.json()
+    start_time = datetime.fromisoformat(health_data['startTime'])
+    print(f"Proxy START_TIME is: {start_time}")
+    
+    bucket = "origin-bucket1"
+    
+    # Find an existing object that was created before START_TIME
+    # The origin buckets were populated during container startup, before our tests run
+    print("Finding an existing object created before START_TIME...")
+    
+    paginator = origin_client.get_paginator("list_object_versions")
+    before_key = None
+    before_etag = None
+    
+    for page in paginator.paginate(Bucket=bucket):
+        if 'Versions' in page:
+            for version in page['Versions']:
+                key = version['Key']
+                last_modified = version['LastModified']
+                
+                # Find the first object created before START_TIME
+                if last_modified < start_time:
+                    before_key = key
+                    before_etag = version['ETag']
+                    print(f"Found object created before START_TIME: {bucket}/{before_key}")
+                    print(f"Last modified: {last_modified}, ETag: {before_etag}")
+                    break
+        if before_key:
+            break
+            
+    if not before_key:
+        pytest.fail("Could not find any objects created before START_TIME")
+    
+    # Get the content of the "before" object via proxy
+    before_response = proxy_client.get_object(Bucket=bucket, Key=before_key)
+    before_content = before_response['Body'].read().decode('utf-8')
+    
+    # 2. Update the object in origin AFTER START_TIME with new content
+    print("Creating a new version of object in origin (after START_TIME)...")
+    after_content = f"Version from AFTER start time: {datetime.now().isoformat()}"
+    origin_client.put_object(Bucket=bucket, Key=before_key, Body=after_content)
+    after_meta = origin_client.head_object(Bucket=bucket, Key=before_key)
+    after_etag = after_meta['ETag']
+    print(f"Created 'after' version with ETag: {after_etag}")
+    
+    # The proxy should still return the 'before' content
+    try:
+        proxy_response = proxy_client.get_object(Bucket=bucket, Key=before_key)
+        proxy_content = proxy_response['Body'].read().decode('utf-8')
+        assert proxy_content == before_content, "Proxy should return the 'before' content"
+        print("✓ Proxy correctly returns 'before' version despite origin update")
+    except Exception as e:
+        pytest.fail(f"Proxy should return 'before' version but got error: {e}")
+    
+    # 3. Test conditional operations using both ETags
+    
+    # 3.1 If-Match with 'before' ETag should succeed through proxy
+    try:
+        test_content = f"Updated via proxy with If-Match before_etag: {datetime.now().isoformat()}"
+        proxy_client.put_object(
+            Bucket=bucket, 
+            Key=before_key, 
+            Body=test_content,
+            IfMatch=before_etag
+        )
+        print("✓ If-Match with 'before' ETag succeeded (correct)")
+        
+        # Verify content was updated
+        updated_response = proxy_client.get_object(Bucket=bucket, Key=before_key)
+        updated_content = updated_response['Body'].read().decode('utf-8')
+        assert test_content in updated_content, "Content should have been updated"
+    except botocore.exceptions.ClientError as e:
+        pytest.fail(f"If-Match with 'before' ETag should succeed but failed: {e}")
+    
+    # 3.2 If-Match with 'after' ETag should fail through proxy
+    # Because from proxy's perspective, that version doesn't exist at START_TIME
+    try:
+        proxy_client.put_object(
+            Bucket=bucket, 
+            Key=before_key, 
+            Body="This update should fail",
+            IfMatch=after_etag
+        )
+        pytest.fail("If-Match with 'after' ETag should fail but succeeded")
+    except botocore.exceptions.ClientError as e:
+        if '412' in str(e) or 'PreconditionFailed' in str(e):
+            print("✓ If-Match with 'after' ETag correctly failed with 412")
+        else:
+            pytest.fail(f"If-Match with 'after' ETag failed with wrong error: {e}")
+    
+    print("All point-in-time conditional tests passed!")
 
 if __name__ == "__main__":
     # Parse command-line arguments
