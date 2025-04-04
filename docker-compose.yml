@@ -2,20 +2,24 @@ version: "3.8"
 
 services:
   s3proxy:
-    build: .
+    build:
+      context: .
+      target: base
     ports:
-      - "9003:9000"
+      - "9004:9000" # Expose the proxy on a different port to avoid conflicts
     environment:
       - OVERLAY_S3_URL=http://minio-overlay:9000
       - OVERLAY_BUCKET=overlay
-      - ORIGIN_S3_URL=https://s3.amazonaws.com
-      - AWS_REGION=us-east-1
+      - ORIGIN_S3_URL=http://minio-origin:9000
+      #      - AWS_REGION=us-east-1
       - OVERLAY_AWS_ACCESS_KEY_ID=overlay-access
       - OVERLAY_AWS_SECRET_ACCESS_KEY=overlay-secret
-      - AWS_PROFILE=${AWS_PROFILE}
+      - AWS_ACCESS_KEY_ID=origin-access
+      - AWS_SECRET_ACCESS_KEY=origin-secret
     depends_on:
       - minio-overlay
-      - minio-init
+      - minio-overlay-init
+      - minio-origin-init
     volumes:
       - "~/.aws:/root/.aws"
 
@@ -29,11 +33,55 @@ services:
       MINIO_ACCESS_KEY: overlay-access
       MINIO_SECRET_KEY: overlay-secret
 
-  minio-init:
+  minio-overlay-init:
     image: minio/mc
     depends_on:
       - minio-overlay
     entrypoint: >
-      /bin/sh -c "until mc alias set local http://minio-overlay:9000 overlay-access overlay-secret; do sleep 1; done;
-      mc mb local/overlay || true;
-      mc version enable local/overlay;"
+      /bin/sh -c "
+      until mc alias set overlay http://minio-overlay:9000 overlay-access overlay-secret; do sleep 1; done;
+      mc mb overlay/overlay || true;
+      mc version enable overlay/overlay;"
+
+  minio-origin:
+    image: minio/minio
+    command: server /data --console-address ":9002"
+    ports:
+      - "9002:9000"
+    environment:
+      MINIO_ACCESS_KEY: origin-access
+      MINIO_SECRET_KEY: origin-secret
+
+  minio-origin-init:
+    image: minio/mc
+    depends_on:
+      - minio-origin
+    entrypoint: >
+      /bin/sh -c "
+      until mc alias set origin http://minio-origin:9000 origin-access origin-secret; do sleep 1; done;
+      mc mb origin/origin-bucket1 || true;
+      mc mb origin/origin-bucket2 || true;
+      mc mb origin/origin-bucket3 || true;
+      mc version enable origin/origin-bucket1;
+      mc version enable origin/origin-bucket2;
+      mc version enable origin/origin-bucket3;"
+
+  minio-waiter:
+    build:
+      context: .
+      target: minio-waiter
+    depends_on:
+      - minio-overlay
+      - minio-origin
+
+  test-runner:
+    build:
+      context: .
+      target: test
+    depends_on:
+      - minio-waiter
+      - s3proxy
+    working_dir: /app/tests
+    entrypoint: >
+      /bin/sh -c "
+      pytest test_regression.py --disable-warnings --capture=no --scale-factor=100;"
