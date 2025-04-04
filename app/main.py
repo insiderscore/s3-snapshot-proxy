@@ -1,6 +1,7 @@
 import httpx
 from fastapi import FastAPI, Request, Response
 import os
+import argparse
 from urllib.parse import quote
 from httpx_auth import AWS4Auth
 import boto3
@@ -10,6 +11,12 @@ import sys
 import xml.etree.ElementTree as ET
 from collections import defaultdict
 
+# Parse command line arguments before initializing FastAPI
+parser = argparse.ArgumentParser(description="S3 Overlay Proxy")
+parser.add_argument('--start-time', type=str, 
+                   help='Start time in ISO-8601 format (YYYY-MM-DDTHH:MM:SSZ). Defaults to current time.')
+args = parser.parse_args()
+
 # Set up logging
 logging.basicConfig(
     level=logging.INFO,
@@ -17,10 +24,29 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)s %(name)s %(message)s"
 )
 
-app = FastAPI()
+# Determine START_TIME
+if args.start_time:
+    try:
+        # Parse the provided start time
+        START_TIME = datetime.fromisoformat(args.start_time.replace('Z', '+00:00'))
+        
+        # Check if time is in the future
+        if START_TIME > datetime.now(timezone.utc):
+            logging.error("Error: Cannot set START_TIME in the future.")
+            logging.error("DMC-12 unavailable. Attempt with Cybertruck failed. (Please specify a time in the past.)")
+            sys.exit(1)
+            
+        logging.info(f"Using custom START_TIME: {START_TIME.isoformat()}")
+    except ValueError as e:
+        logging.error(f"Invalid start-time format. Please use ISO-8601 format (YYYY-MM-DDTHH:MM:SSZ).")
+        logging.error(f"Error: {e}")
+        sys.exit(1)
+else:
+    # Use current time if no start-time provided
+    START_TIME = datetime.now(timezone.utc)
+    logging.info(f"Using current time as START_TIME: {START_TIME.isoformat()}")
 
-# Record proxy startup time (UTC)
-START_TIME = datetime.now(timezone.utc)
+app = FastAPI()
 
 # Configurable base URLs
 OVERLAY_S3_URL = os.environ.get("OVERLAY_S3_URL", "http://overlay-s3.local")
