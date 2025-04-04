@@ -27,6 +27,85 @@ OVERLAY_S3_URL = os.environ.get("OVERLAY_S3_URL", "http://overlay-s3.local")
 ORIGIN_S3_URL = os.environ.get("ORIGIN_S3_URL", "https://s3.amazonaws.com")
 OVERLAY_BUCKET = os.environ.get("OVERLAY_BUCKET", "overlay")
 
+# Add health check endpoints for different purposes
+@app.get("/health")
+async def health_check():
+    """
+    Simple health check endpoint that returns the service status
+    and proxy start time.
+    """
+    return {
+        "status": "healthy",
+        "startTime": START_TIME.isoformat(),
+        "overlayS3": OVERLAY_S3_URL,
+        "originS3": ORIGIN_S3_URL,
+        "overlayBucket": OVERLAY_BUCKET,
+    }
+
+@app.get("/livez")
+async def liveness_probe():
+    """
+    Kubernetes liveness probe endpoint.
+    Simple check that the application is running.
+    """
+    return {"status": "alive"}
+
+@app.get("/readyz")
+async def readiness_probe():
+    """
+    Kubernetes readiness probe endpoint.
+    Verifies the application can connect to its dependencies.
+    """
+    status = {"ready": True, "components": {}}
+    
+    # Check overlay S3 connection
+    try:
+        s3_client_overlay = boto3.client(
+            "s3",
+            aws_access_key_id=overlay_credentials.access_key,
+            aws_secret_access_key=overlay_credentials.secret_key,
+            aws_session_token=overlay_credentials.token if hasattr(overlay_credentials, 'token') else None,
+            endpoint_url=OVERLAY_S3_URL
+        )
+        # Check if overlay bucket exists
+        s3_client_overlay.head_bucket(Bucket=OVERLAY_BUCKET)
+        status["components"]["overlay_s3"] = "connected"
+    except Exception as e:
+        logging.warning(f"Overlay S3 connection failed: {str(e)}")
+        status["ready"] = False
+        status["components"]["overlay_s3"] = f"connection_failed: {str(e)}"
+    
+    # We don't strictly need to check origin S3 if we're just reading from overlay
+    # But include a basic check that credentials are valid
+    try:
+        s3_client_origin = boto3.client(
+            "s3",
+            aws_access_key_id=origin_credentials.access_key,
+            aws_secret_access_key=origin_credentials.secret_key,
+            aws_session_token=origin_credentials.token if hasattr(origin_credentials, 'token') else None,
+            endpoint_url=ORIGIN_S3_URL
+        )
+        # Just check if we can access the service
+        s3_client_origin.list_buckets()
+        status["components"]["origin_s3"] = "connected"
+    except Exception as e:
+        # Origin failure is non-fatal if we're operating in overlay-only mode
+        logging.warning(f"Origin S3 connection check failed: {str(e)}")
+        status["components"]["origin_s3"] = f"connection_failed: {str(e)}"
+    
+    if status["ready"]:
+        return status
+    else:
+        return Response(status_code=503, content=str(status))
+
+# Also provide a root endpoint for basic health checks
+@app.get("/")
+async def root():
+    """
+    Basic health check at the root path
+    """
+    return {"status": "healthy"}
+
 # Create a boto3 session (using default configuration)
 session = boto3.Session()
 default_credentials = session.get_credentials()
