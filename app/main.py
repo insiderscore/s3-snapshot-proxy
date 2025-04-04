@@ -11,12 +11,6 @@ import sys
 import xml.etree.ElementTree as ET
 from collections import defaultdict
 
-# Parse command line arguments before initializing FastAPI
-parser = argparse.ArgumentParser(description="S3 Overlay Proxy")
-parser.add_argument('--start-time', type=str, 
-                   help='Start time in ISO-8601 format (YYYY-MM-DDTHH:MM:SSZ). Defaults to current time.')
-args = parser.parse_args()
-
 # Set up logging
 logging.basicConfig(
     level=logging.INFO,
@@ -24,25 +18,26 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)s %(name)s %(message)s"
 )
 
-# Determine START_TIME
-if args.start_time:
+# Determine START_TIME from environment variable instead of command line
+start_time_str = os.environ.get("START_TIME")
+if start_time_str:
     try:
         # Parse the provided start time
-        START_TIME = datetime.fromisoformat(args.start_time.replace('Z', '+00:00'))
+        START_TIME = datetime.fromisoformat(start_time_str.replace('Z', '+00:00'))
         
         # Check if time is in the future
         if START_TIME > datetime.now(timezone.utc):
             logging.error("Error: Cannot set START_TIME in the future.")
-            logging.error("DMC-12 unavailable. Attempt with Cybertruck failed. (Please specify a time in the past.)")
+            logging.error("DMC-12 unavailable. Attempt with Cybertruck failed. (snapshot start time must be in the past.)")
             sys.exit(1)
             
         logging.info(f"Using custom START_TIME: {START_TIME.isoformat()}")
     except ValueError as e:
-        logging.error(f"Invalid start-time format. Please use ISO-8601 format (YYYY-MM-DDTHH:MM:SSZ).")
+        logging.error(f"Invalid START_TIME format. Please use ISO-8601 format (YYYY-MM-DDTHH:MM:SSZ).")
         logging.error(f"Error: {e}")
         sys.exit(1)
 else:
-    # Use current time if no start-time provided
+    # Use current time if no START_TIME provided
     START_TIME = datetime.now(timezone.utc)
     logging.info(f"Using current time as START_TIME: {START_TIME.isoformat()}")
 
