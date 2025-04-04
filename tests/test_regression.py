@@ -8,7 +8,8 @@ import pytest
 import botocore.exceptions
 import json
 import requests
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
+import time
 
 # Helper to generate random object keys with varying depth
 def random_key(prefix, size=10, max_depth=5):
@@ -183,6 +184,343 @@ def test_proxy(scale_factor):
             assert "404" in str(e.value), f"Object {bucket}/{key} created after START_TIME is incorrectly visible"
 
     print("Proxy test passed! All behaviors verified.")
+
+    # Add after all other tests
+    print("\n=== Testing Conditional Requests ===\n")
+    test_conditional_requests(scale_factor)
+
+def test_conditional_requests(scale_factor):
+    """Test conditional requests against the S3 overlay proxy"""
+    print("Testing conditional request handling...")
+    
+    # Set up clients
+    origin_client = boto3.client(
+        "s3",
+        endpoint_url="http://minio-origin:9000",
+        aws_access_key_id="origin-access",
+        aws_secret_access_key="origin-secret"
+    )
+    proxy_client = boto3.client(
+        "s3",
+        endpoint_url="http://s3proxy:9000",
+        aws_access_key_id="origin-access",
+        aws_secret_access_key="origin-secret"
+    )
+    
+    bucket = "origin-bucket1"  # Use the first bucket for conditional tests
+    
+    # 1. Set up test objects
+    print("Setting up test objects for conditional requests...")
+    
+    # Create an object directly in origin
+    origin_key = f"origin-conditional-{random.randint(1000, 9999)}"
+    origin_content = f"Origin conditional test content {random.randint(1, 1000)}"
+    origin_client.put_object(Bucket=bucket, Key=origin_key, Body=origin_content)
+    
+    # Get its ETag and LastModified
+    origin_meta = origin_client.head_object(Bucket=bucket, Key=origin_key)
+    origin_etag = origin_meta['ETag']
+    origin_last_modified = origin_meta['LastModified']
+    print(f"Created origin object {bucket}/{origin_key} with ETag {origin_etag}")
+    
+    # Create an object via proxy
+    proxy_key = f"proxy-conditional-{random.randint(1000, 9999)}"
+    proxy_content = f"Proxy conditional test content {random.randint(1, 1000)}"
+    proxy_client.put_object(Bucket=bucket, Key=proxy_key, Body=proxy_content)
+    
+    # Get its ETag and LastModified
+    proxy_meta = proxy_client.head_object(Bucket=bucket, Key=proxy_key)
+    proxy_etag = proxy_meta['ETag']
+    print(f"Created proxy object {bucket}/{proxy_key} with ETag {proxy_etag}")
+    
+    # Wait a moment to ensure timestamps differ
+    time.sleep(1)
+    
+    # 2. Test If-Match conditions
+    print("Testing If-Match conditions...")
+    
+    # 2.1 If-Match with correct ETag should succeed
+    try:
+        response = proxy_client.put_object(
+            Bucket=bucket, 
+            Key=origin_key, 
+            Body="Updated via If-Match",
+            IfMatch=origin_etag
+        )
+        print("✓ If-Match with correct ETag succeeded")
+        
+        # Get the updated ETag after modification
+        updated_meta = proxy_client.head_object(Bucket=bucket, Key=origin_key)
+        updated_etag = updated_meta['ETag']
+        print(f"Object updated, new ETag is {updated_etag}")
+        
+    except botocore.exceptions.ClientError as e:
+        if '412' in str(e):
+            pytest.fail(f"If-Match with correct ETag should succeed but got 412: {e}")
+        else:
+            pytest.fail(f"If-Match with correct ETag failed with unexpected error: {e}")
+            
+    # 2.2 If-Match with incorrect ETag should fail with 412
+    incorrect_etag = '"00000000000000000000000000000000"'
+    try:
+        response = proxy_client.put_object(
+            Bucket=bucket, 
+            Key=origin_key, 
+            Body="Should not update",
+            IfMatch=incorrect_etag
+        )
+        pytest.fail(f"If-Match with incorrect ETag should fail but succeeded")
+    except botocore.exceptions.ClientError as e:
+        if '412' in str(e) or 'PreconditionFailed' in str(e):
+            print("✓ If-Match with incorrect ETag correctly failed with precondition error")
+        else:
+            pytest.fail(f"If-Match with incorrect ETag failed with wrong error: {e}")
+    
+    # 3. Test If-None-Match conditions
+    print("Testing If-None-Match conditions...")
+    
+    # 3.1 If-None-Match with different ETag should succeed
+    try:
+        new_key = f"if-none-match-{random.randint(1000, 9999)}"
+        response = proxy_client.put_object(
+            Bucket=bucket, 
+            Key=new_key, 
+            Body="Created with If-None-Match",
+            IfNoneMatch=origin_etag  # Using ETag from a different object
+        )
+        print("✓ If-None-Match with different ETag succeeded")
+    except botocore.exceptions.ClientError as e:
+        pytest.fail(f"If-None-Match with different ETag should succeed but failed: {e}")
+    
+    # 3.2 If-None-Match with matching ETag should fail with 412
+    try:
+        response = proxy_client.put_object(
+            Bucket=bucket, 
+            Key=proxy_key, 
+            Body="Should not update",
+            IfNoneMatch=proxy_etag
+        )
+        pytest.fail(f"If-None-Match with matching ETag should fail but succeeded")
+    except botocore.exceptions.ClientError as e:
+        if '412' in str(e) or 'PreconditionFailed' in str(e):
+            print("✓ If-None-Match with matching ETag correctly failed with precondition error")
+        else:
+            pytest.fail(f"If-None-Match with matching ETag failed with wrong error: {e}")
+    
+    # 3.3 If-None-Match='*' for existing object should fail with 412
+    try:
+        response = proxy_client.put_object(
+            Bucket=bucket, 
+            Key=proxy_key, 
+            Body="Should not update",
+            IfNoneMatch="*"
+        )
+        pytest.fail(f"If-None-Match='*' for existing object should fail but succeeded")
+    except botocore.exceptions.ClientError as e:
+        if '412' in str(e) or 'PreconditionFailed' in str(e):
+            print("✓ If-None-Match='*' for existing object correctly failed with precondition error")
+        else:
+            pytest.fail(f"If-None-Match='*' for existing object failed with wrong error: {e}")
+    
+    # 3.4 If-None-Match='*' for new object should succeed
+    try:
+        new_key = f"if-none-match-star-{random.randint(1000, 9999)}"
+        response = proxy_client.put_object(
+            Bucket=bucket, 
+            Key=new_key, 
+            Body="Created with If-None-Match='*'",
+            IfNoneMatch="*"
+        )
+        print("✓ If-None-Match='*' for new object succeeded")
+    except botocore.exceptions.ClientError as e:
+        pytest.fail(f"If-None-Match='*' for new object should succeed but failed: {e}")
+    
+    # Note: Skipping time-based preconditions (IfModifiedSince/IfUnmodifiedSince) 
+    # with PUT operations as they're not supported by the S3 API
+    
+    # 4. Test time-based conditions with GET
+    print("Testing time-based conditions with GET...")
+    
+    # Format timestamps for HTTP headers
+    format_time = lambda dt: dt.strftime('%a, %d %b %Y %H:%M:%S GMT')
+    past_time = format_time(datetime.now(timezone.utc) - timedelta(hours=1))
+    future_time = format_time(datetime.now(timezone.utc) + timedelta(hours=1))
+    
+    # 4.1 If-Modified-Since with past date should succeed (return the object)
+    try:
+        response = proxy_client.get_object(
+            Bucket=bucket, 
+            Key=origin_key, 
+            IfModifiedSince=past_time
+        )
+        print("✓ GET with If-Modified-Since in past succeeded")
+    except botocore.exceptions.ClientError as e:
+        pytest.fail(f"GET with If-Modified-Since in past should succeed but failed: {e}")
+    
+    # 4.2 If-Modified-Since with future date should fail with 304 Not Modified
+    try:
+        response = proxy_client.get_object(
+            Bucket=bucket, 
+            Key=origin_key, 
+            IfModifiedSince=future_time
+        )
+        pytest.fail("GET with If-Modified-Since in future should fail but succeeded")
+    except botocore.exceptions.ClientError as e:
+        if '304' in str(e) or 'Not Modified' in str(e):
+            print("✓ GET with If-Modified-Since in future correctly returned 304 Not Modified")
+        else:
+            pytest.fail(f"GET with If-Modified-Since in future failed with wrong error: {e}")
+    
+    # 4.3 If-Unmodified-Since with future date should succeed
+    try:
+        response = proxy_client.get_object(
+            Bucket=bucket, 
+            Key=origin_key,
+            IfUnmodifiedSince=future_time
+        )
+        print("✓ GET with If-Unmodified-Since in future succeeded")
+    except botocore.exceptions.ClientError as e:
+        pytest.fail(f"GET with If-Unmodified-Since in future should succeed but failed: {e}")
+    
+    # 4.4 If-Unmodified-Since with past date should fail with 412
+    # (Assuming the object was modified after the past_time)
+    try:
+        response = proxy_client.get_object(
+            Bucket=bucket, 
+            Key=origin_key,
+            IfUnmodifiedSince=past_time
+        )
+        pytest.fail("GET with If-Unmodified-Since in past should fail but succeeded")
+    except botocore.exceptions.ClientError as e:
+        if '412' in str(e) or 'PreconditionFailed' in str(e):
+            print("✓ GET with If-Unmodified-Since in past correctly failed with 412")
+        else:
+            pytest.fail(f"GET with If-Unmodified-Since in past failed with wrong error: {e}")
+    
+    # 5. Complex test: conditional delete based on ETag from origin
+    print("Testing complex conditional scenario...")
+    
+    # Create new object in origin to test conditional delete
+    delete_key = f"conditional-delete-{random.randint(1000, 9999)}"
+    origin_client.put_object(Bucket=bucket, Key=delete_key, Body="To be conditionally deleted")
+    delete_meta = origin_client.head_object(Bucket=bucket, Key=delete_key)
+    delete_etag = delete_meta['ETag']
+    
+    # Delete should succeed with correct ETag
+    try:
+        response = proxy_client.delete_object(
+            Bucket=bucket, 
+            Key=delete_key, 
+            IfMatch=delete_etag
+        )
+        print("✓ Conditional delete with correct ETag succeeded")
+    except botocore.exceptions.ClientError as e:
+        pytest.fail(f"Conditional delete with correct ETag should succeed but failed: {e}")
+    
+    # Verify the object is deleted
+    try:
+        proxy_client.head_object(Bucket=bucket, Key=delete_key)
+        pytest.fail("Object should be deleted but still exists")
+    except botocore.exceptions.ClientError as e:
+        if '404' in str(e):
+            print("✓ Object was correctly deleted")
+        else:
+            pytest.fail(f"Expected 404 for deleted object but got: {e}")
+    
+    # 6. Test HEAD method with conditional headers
+    print("Testing conditional HEAD requests...")
+    
+    # 6.1 HEAD with If-Match
+    try:
+        response = proxy_client.head_object(
+            Bucket=bucket, 
+            Key=origin_key,
+            IfMatch=updated_etag  # Use the new ETag, not the original one
+        )
+        print("✓ HEAD with If-Match succeeded")
+    except botocore.exceptions.ClientError as e:
+        pytest.fail(f"HEAD with If-Match should succeed but failed: {e}")
+    
+    # 6.2 HEAD with If-None-Match (should fail for matching ETag)
+    try:
+        response = proxy_client.head_object(
+            Bucket=bucket, 
+            Key=origin_key,
+            IfNoneMatch=updated_etag  # Use the current ETag, not the original one
+        )
+        pytest.fail("HEAD with If-None-Match matching ETag should fail but succeeded")
+    except botocore.exceptions.ClientError as e:
+        if '304' in str(e) or 'Not Modified' in str(e):
+            print("✓ HEAD with If-None-Match correctly returned 304 Not Modified")
+        else:
+            pytest.fail(f"HEAD with If-None-Match failed with wrong error: {e}")
+    
+    # 7. Test GET with ETag conditions
+    print("Testing GET with ETag conditions...")
+    
+    # 7.1 GET with If-Match
+    try:
+        response = proxy_client.get_object(
+            Bucket=bucket, 
+            Key=origin_key,
+            IfMatch=updated_etag  # Use the new ETag here too
+        )
+        print("✓ GET with If-Match succeeded")
+    except botocore.exceptions.ClientError as e:
+        pytest.fail(f"GET with If-Match should succeed but failed: {e}")
+    
+    # 7.2 GET with If-None-Match (should fail for matching ETag)
+    try:
+        response = proxy_client.get_object(
+            Bucket=bucket, 
+            Key=origin_key,
+            IfNoneMatch=updated_etag  # Use the current ETag, not the original one
+        )
+        pytest.fail("GET with If-None-Match matching ETag should fail but succeeded")
+    except botocore.exceptions.ClientError as e:
+        if '304' in str(e) or 'Not Modified' in str(e):
+            print("✓ GET with If-None-Match correctly returned 304 Not Modified")
+        else:
+            pytest.fail(f"GET with If-None-Match failed with wrong error: {e}")
+    
+    # 8. Test DELETE with supported conditional headers
+    print("Testing DELETE with proper conditional headers...")
+    
+    # Create objects for conditional DELETE tests
+    delete_match_key = f"if-match-delete-{random.randint(1000, 9999)}"
+    proxy_client.put_object(Bucket=bucket, Key=delete_match_key, Body="To be conditionally deleted")
+    delete_meta = proxy_client.head_object(Bucket=bucket, Key=delete_match_key)
+    delete_match_etag = delete_meta['ETag']
+    last_modified = delete_meta['LastModified']
+    
+    # Wait briefly to ensure consistency
+    time.sleep(1)
+    
+    # 8.1 DELETE with If-Match correct ETag (should succeed)
+    try:
+        response = proxy_client.delete_object(
+            Bucket=bucket, 
+            Key=delete_match_key,
+            IfMatch=delete_match_etag
+        )
+        print("✓ DELETE with If-Match correct ETag succeeded")
+    except botocore.exceptions.ClientError as e:
+        pytest.fail(f"DELETE with If-Match correct ETag should succeed but failed: {e}")
+    
+    # Verify object is deleted
+    try:
+        proxy_client.head_object(Bucket=bucket, Key=delete_match_key)
+        pytest.fail("Object should be deleted but still exists (If-Match delete)")
+    except botocore.exceptions.ClientError as e:
+        if '404' in str(e):
+            print("✓ Object was correctly deleted with If-Match condition")
+        else:
+            pytest.fail(f"Expected 404 for deleted object but got: {e}")
+    
+    # We'll skip testing IfMatchLastModifiedTime and IfMatchSize as they're S3-specific
+    # headers that our proxy might not fully implement yet
+
+    print("All conditional request tests passed!")
 
 if __name__ == "__main__":
     # Parse command-line arguments
