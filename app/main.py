@@ -207,11 +207,11 @@ async def handle_precondition_failure(
     candidate_time = None
     if "Versions" in versions_response:
         for ver in versions_response["Versions"]:
-            last_modified = ver["LastModified"]
-            if last_modified < START_TIME:
-                if candidate is None or last_modified > candidate_time:
+            # Use our factored function instead of repeating the condition
+            if filter_version_by_start_time(ver, START_TIME):
+                if candidate is None or ver["LastModified"] > candidate_time:
                     candidate = ver
-                    candidate_time = last_modified
+                    candidate_time = ver["LastModified"]
 
     if candidate is None:
         logging.info("No matching version found for key %s before START_TIME. Returning 404.", key)
