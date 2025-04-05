@@ -192,6 +192,9 @@ def test_proxy(scale_factor):
     # Add our new point-in-time test
     test_point_in_time_conditional()
 
+    # Add our new conditional delete test
+    test_conditional_delete_operations()
+
 def test_conditional_requests(scale_factor):
     """Test conditional requests against the S3 overlay proxy"""
     print("Testing conditional request handling...")
@@ -560,24 +563,43 @@ def test_point_in_time_conditional():
     before_key = None
     before_etag = None
     
+    # Make sure we're using an object that doesn't yet exist in overlay
+    found_suitable_object = False
+    
     for page in paginator.paginate(Bucket=bucket):
         if 'Versions' in page:
             for version in page['Versions']:
                 key = version['Key']
                 last_modified = version['LastModified']
                 
-                # Find the first object created before START_TIME
+                # Find an object created before START_TIME
                 if last_modified < start_time:
-                    before_key = key
-                    before_etag = version['ETag']
-                    print(f"Found object created before START_TIME: {bucket}/{before_key}")
-                    print(f"Last modified: {last_modified}, ETag: {before_etag}")
-                    break
-        if before_key:
+                    # Check if this object exists in overlay bucket
+                    overlay_path = f"{bucket}/{key}"
+                    try:
+                        # Try to access it directly through the overlay S3 endpoint
+                        overlay_client = boto3.client(
+                            "s3",
+                            endpoint_url=health_data.get('overlayS3', "http://minio-overlay:9000"),
+                            aws_access_key_id="overlay-access",
+                            aws_secret_access_key="overlay-secret"
+                        )
+                        overlay_client.head_object(Bucket=health_data.get('overlayBucket', 'overlay'), Key=overlay_path)
+                        # Object exists in overlay, skip it
+                        continue
+                    except Exception:
+                        # Object doesn't exist in overlay, good candidate
+                        before_key = key
+                        before_etag = version['ETag']
+                        found_suitable_object = True
+                        print(f"Found suitable object created before START_TIME: {bucket}/{before_key}")
+                        print(f"Last modified: {last_modified}, ETag: {before_etag}")
+                        break
+        if found_suitable_object:
             break
             
-    if not before_key:
-        pytest.fail("Could not find any objects created before START_TIME")
+    if not found_suitable_object:
+        pytest.fail("Could not find any suitable objects created before START_TIME")
     
     # Get the content of the "before" object via proxy
     before_response = proxy_client.get_object(Bucket=bucket, Key=before_key)
@@ -640,6 +662,187 @@ def test_point_in_time_conditional():
             pytest.fail(f"If-Match with 'after' ETag failed with wrong error: {e}")
     
     print("All point-in-time conditional tests passed!")
+
+def test_conditional_delete_operations():
+    """Test conditional DELETE operations against objects in origin that don't exist in overlay"""
+    print("\n=== Testing Conditional DELETE Operations ===\n")
+    
+    # Set up clients
+    origin_client = boto3.client(
+        "s3",
+        endpoint_url="http://minio-origin:9000",
+        aws_access_key_id="origin-access",
+        aws_secret_access_key="origin-secret"
+    )
+    proxy_client = boto3.client(
+        "s3",
+        endpoint_url="http://s3proxy:9000",
+        aws_access_key_id="origin-access",
+        aws_secret_access_key="origin-secret"
+    )
+    
+    # Get the proxy's START_TIME
+    health_url = f"http://s3proxy:9000/health"
+    response = requests.get(health_url)
+    health_data = response.json()
+    start_time = datetime.fromisoformat(health_data['startTime'])
+    
+    bucket = "origin-bucket1"
+    
+    # Find multiple objects that exist in origin but not in overlay
+    print("Finding objects that exist in origin but not in overlay...")
+    
+    paginator = origin_client.get_paginator("list_object_versions")
+    suitable_objects = []
+    needed_objects = 5  # We need several objects for different test cases
+    
+    for page in paginator.paginate(Bucket=bucket):
+        if 'Versions' in page:
+            for version in page['Versions']:
+                key = version['Key']
+                last_modified = version['LastModified']
+                
+                # Find an object created before START_TIME
+                if last_modified < start_time:
+                    overlay_path = f"{bucket}/{key}"
+                    try:
+                        overlay_client = boto3.client(
+                            "s3",
+                            endpoint_url=health_data.get('overlayS3', "http://minio-overlay:9000"),
+                            aws_access_key_id="overlay-access",
+                            aws_secret_access_key="overlay-secret"
+                        )
+                        overlay_client.head_object(Bucket=health_data.get('overlayBucket', 'overlay'), Key=overlay_path)
+                        # Object exists in overlay, skip it
+                        continue
+                    except Exception:
+                        # Good candidate - save the object info
+                        suitable_objects.append({
+                            'key': key,
+                            'etag': version['ETag'],
+                            'last_modified': last_modified
+                        })
+                        print(f"Found suitable object: {bucket}/{key}, ETag: {version['ETag']}")
+                        if len(suitable_objects) >= needed_objects:
+                            break
+        if len(suitable_objects) >= needed_objects:
+            break
+    
+    if len(suitable_objects) < needed_objects:
+        print(f"Warning: Found only {len(suitable_objects)} suitable objects, continuing with those")
+    
+    if not suitable_objects:
+        pytest.fail("Could not find any suitable objects for testing")
+    
+    # 1. DELETE with If-Match using correct ETag should succeed
+    if suitable_objects:
+        obj = suitable_objects.pop(0)
+        print(f"\n1. Testing DELETE with If-Match=<correct-etag> for {bucket}/{obj['key']}")
+        try:
+            proxy_client.delete_object(
+                Bucket=bucket,
+                Key=obj['key'],
+                IfMatch=obj['etag']  # Origin ETag is correct for condition
+            )
+            print("✓ DELETE with correct If-Match succeeded")
+            
+            # Verify object appears deleted through proxy
+            try:
+                proxy_client.head_object(Bucket=bucket, Key=obj['key'])
+                pytest.fail("Object should appear deleted through proxy but still exists")
+            except botocore.exceptions.ClientError as e:
+                if '404' in str(e):
+                    print("✓ Object correctly appears deleted through proxy")
+                else:
+                    pytest.fail(f"Expected 404 for deleted object but got: {e}")
+                    
+            # Verify object still exists in origin (proxy only created a delete marker in overlay)
+            try:
+                origin_client.head_object(Bucket=bucket, Key=obj['key'])
+                print("✓ Object still exists in origin as expected")
+            except Exception as e:
+                pytest.fail(f"Object should still exist in origin but got error: {e}")
+        except botocore.exceptions.ClientError as e:
+            pytest.fail(f"DELETE with correct If-Match failed: {e}")
+    
+    # 2. DELETE with If-Match using incorrect ETag should fail with 412
+    if suitable_objects:
+        obj = suitable_objects.pop(0)
+        print(f"\n2. Testing DELETE with If-Match=<incorrect-etag> for {bucket}/{obj['key']}")
+        incorrect_etag = '"00000000000000000000000000000000"'  # Obviously wrong ETag
+        try:
+            proxy_client.delete_object(
+                Bucket=bucket,
+                Key=obj['key'],
+                IfMatch=incorrect_etag
+            )
+            pytest.fail("DELETE with incorrect If-Match should fail but succeeded")
+        except botocore.exceptions.ClientError as e:
+            if '412' in str(e) or 'PreconditionFailed' in str(e):
+                print("✓ DELETE with incorrect If-Match correctly failed with 412")
+            else:
+                pytest.fail(f"DELETE with incorrect If-Match failed with wrong error: {e}")
+    
+    # 3. DELETE with If-None-Match using non-matching ETag should succeed
+    if suitable_objects:
+        obj = suitable_objects.pop(0)
+        print(f"\n3. Testing DELETE with If-None-Match=<non-matching-etag> for {bucket}/{obj['key']}")
+        non_matching_etag = '"00000000000000000000000000000000"'  # Obviously non-matching ETag
+        try:
+            proxy_client.delete_object(
+                Bucket=bucket,
+                Key=obj['key'],
+                IfNoneMatch=non_matching_etag
+            )
+            print("✓ DELETE with non-matching If-None-Match succeeded")
+            
+            # Verify object appears deleted
+            try:
+                proxy_client.head_object(Bucket=bucket, Key=obj['key'])
+                pytest.fail("Object should appear deleted but still accessible")
+            except botocore.exceptions.ClientError as e:
+                if '404' in str(e):
+                    print("✓ Object correctly appears deleted")
+                else:
+                    pytest.fail(f"Expected 404 for deleted object but got: {e}")
+        except botocore.exceptions.ClientError as e:
+            pytest.fail(f"DELETE with non-matching If-None-Match failed: {e}")
+    
+    # 4. DELETE with If-None-Match using matching ETag should fail with 412
+    if suitable_objects:
+        obj = suitable_objects.pop(0)
+        print(f"\n4. Testing DELETE with If-None-Match=<matching-etag> for {bucket}/{obj['key']}")
+        try:
+            proxy_client.delete_object(
+                Bucket=bucket,
+                Key=obj['key'],
+                IfNoneMatch=obj['etag']  # Origin's ETag should match
+            )
+            pytest.fail("DELETE with matching If-None-Match should fail but succeeded")
+        except botocore.exceptions.ClientError as e:
+            if '412' in str(e) or 'PreconditionFailed' in str(e):
+                print("✓ DELETE with matching If-None-Match correctly failed with 412")
+            else:
+                pytest.fail(f"DELETE with matching If-None-Match failed with wrong error: {e}")
+    
+    # 5. DELETE with If-None-Match="*" should fail with 412 (since object exists)
+    if suitable_objects:
+        obj = suitable_objects.pop(0)
+        print(f"\n5. Testing DELETE with If-None-Match=* for {bucket}/{obj['key']}")
+        try:
+            proxy_client.delete_object(
+                Bucket=bucket,
+                Key=obj['key'],
+                IfNoneMatch="*"
+            )
+            pytest.fail('DELETE with If-None-Match="*" should fail but succeeded')
+        except botocore.exceptions.ClientError as e:
+            if '412' in str(e) or 'PreconditionFailed' in str(e):
+                print('✓ DELETE with If-None-Match="*" correctly failed with 412')
+            else:
+                pytest.fail(f'DELETE with If-None-Match="*" failed with wrong error: {e}')
+    
+    print("\nAll conditional DELETE operation tests completed!")
 
 if __name__ == "__main__":
     # Parse command-line arguments
