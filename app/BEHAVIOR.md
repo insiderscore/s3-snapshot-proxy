@@ -24,6 +24,8 @@ Pre-requisites:
 
 - The origin buckets and the overlay bucket must have versioning enabled.
 
+- The overlay bucket must not contain objects created before START_TIME
+
 - The client must sign requests to the proxy with credentials which
   would allow it to make read-only requests to the origin buckets. The
   proxy will not attempt to write to the origin buckets, but as a matter
