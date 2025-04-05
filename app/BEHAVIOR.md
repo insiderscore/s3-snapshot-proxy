@@ -41,3 +41,17 @@ Pre-requisites:
   bucket, which it uses to store updated versions of objects including
   delete markers
 
+Compatible handling of DELETE requests
+
+- When running against a real Amazon S3 endpoint, a delete marker will
+  be created for each DELETE request, even if there is no objects or
+  current undeleted version for the target key. When running against
+  minio, DELETE against a non-existent or already deleted key returns
+  success but does not create a delete marker for already deleted or
+  non-existent objects. Our overlay bucket could be stored on either s3
+  or minio, so our proxy must cope with both implementations. 
+
+- For standard versioned buckets on a real S3 endpoint, conditional
+  DELETE requests return 501. On minio, preconditions on DELETE requests
+  are silently ignored. Our proxy should not forward conditional DELETE
+  requests and instead return 501.

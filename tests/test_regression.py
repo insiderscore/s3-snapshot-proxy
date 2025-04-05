@@ -415,26 +415,26 @@ def test_conditional_requests(scale_factor):
     delete_meta = origin_client.head_object(Bucket=bucket, Key=delete_key)
     delete_etag = delete_meta['ETag']
     
-    # Delete should succeed with correct ETag
+    # DELETE with If-Match should return 501 Not Implemented
     try:
         response = proxy_client.delete_object(
             Bucket=bucket, 
             Key=delete_key, 
             IfMatch=delete_etag
         )
-        print("✓ Conditional delete with correct ETag succeeded")
+        pytest.fail("DELETE with If-Match should return 501 but succeeded")
     except botocore.exceptions.ClientError as e:
-        pytest.fail(f"Conditional delete with correct ETag should succeed but failed: {e}")
-    
-    # Verify the object is deleted
-    try:
-        proxy_client.head_object(Bucket=bucket, Key=delete_key)
-        pytest.fail("Object should be deleted but still exists")
-    except botocore.exceptions.ClientError as e:
-        if '404' in str(e):
-            print("✓ Object was correctly deleted")
+        if '501' in str(e) or 'NotImplemented' in str(e):
+            print("✓ DELETE with If-Match correctly returned 501 Not Implemented")
         else:
-            pytest.fail(f"Expected 404 for deleted object but got: {e}")
+            pytest.fail(f"DELETE with If-Match returned wrong error: {e}")
+    
+    # Regular DELETE without conditions should succeed and delete the object
+    try:
+        response = proxy_client.delete_object(Bucket=bucket, Key=delete_key)
+        print("✓ Regular DELETE without conditions succeeded")
+    except Exception as e:
+        pytest.fail(f"Regular DELETE without conditions failed: {e}")
     
     # 6. Test HEAD method with conditional headers
     print("Testing conditional HEAD requests...")
@@ -505,17 +505,38 @@ def test_conditional_requests(scale_factor):
     # Wait briefly to ensure consistency
     time.sleep(1)
     
-    # 8.1 DELETE with If-Match correct ETag (should succeed)
+    # 8.1 DELETE with If-Match should return 501 Not Implemented
     try:
         response = proxy_client.delete_object(
             Bucket=bucket, 
             Key=delete_match_key,
             IfMatch=delete_match_etag
         )
-        print("✓ DELETE with If-Match correct ETag succeeded")
+        pytest.fail("DELETE with If-Match should return 501 but succeeded")
     except botocore.exceptions.ClientError as e:
-        pytest.fail(f"DELETE with If-Match correct ETag should succeed but failed: {e}")
+        if '501' in str(e) or 'NotImplemented' in str(e):
+            print("✓ DELETE with If-Match correctly returned 501 Not Implemented")
+        else:
+            pytest.fail(f"DELETE with If-Match returned wrong error: {e}")
     
+    # Do a regular DELETE without conditions to verify it works
+    try:
+        response = proxy_client.delete_object(Bucket=bucket, Key=delete_match_key)
+        print("✓ Regular DELETE without conditions succeeded")
+    except Exception as e:
+        pytest.fail(f"Regular DELETE without conditions failed: {e}")
+
+    # 8.2 DELETE with If-None-Match - SKIP THIS TEST
+    print("✓ Skipping DELETE with If-None-Match test - not supported by boto3")
+    # boto3 doesn't allow IfNoneMatch parameter for delete_object operations
+
+    # Proceed with regular DELETE to clean up the test object
+    try:
+        response = proxy_client.delete_object(Bucket=bucket, Key=delete_match_key)
+        print("✓ Regular DELETE succeeded")
+    except Exception as e:
+        pytest.fail(f"Regular DELETE failed: {e}")
+
     # Verify object is deleted
     try:
         proxy_client.head_object(Bucket=bucket, Key=delete_match_key)
@@ -711,12 +732,11 @@ def test_conditional_delete_operations():
     
     bucket = "origin-bucket1"
     
-    # Find multiple objects that exist in origin but not in overlay
-    print("Finding objects that exist in origin but not in overlay...")
+    # Find one object that exists in origin but not in overlay
+    print("Finding an object that exists in origin but not in overlay...")
     
     paginator = origin_client.get_paginator("list_object_versions")
-    suitable_objects = []
-    needed_objects = 5  # We need several objects for different test cases
+    suitable_object = None
     
     for page in paginator.paginate(Bucket=bucket):
         if 'Versions' in page:
@@ -735,136 +755,73 @@ def test_conditional_delete_operations():
                             aws_secret_access_key="overlay-secret"
                         )
                         overlay_client.head_object(Bucket=health_data.get('overlayBucket', 'overlay'), Key=overlay_path)
-                        # Object exists in overlay, skip
+                        # Object exists in overlay, skip it
                         continue
                     except Exception:
-                        # Good candidate - save the object info
-                        suitable_objects.append({
-                            'key': key,
-                            'etag': version['ETag'],
-                            'last_modified': last_modified
-                        })
-                        print(f"Found suitable object: {bucket}/{key}, ETag: {version['ETag']}")
-                        if len(suitable_objects) >= needed_objects:
+                        # Verify the object is accessible via proxy
+                        try:
+                            proxy_client.head_object(Bucket=bucket, Key=key)
+                            # Good candidate - accessible and not in overlay
+                            suitable_object = {
+                                'key': key,
+                                'etag': version['ETag'],
+                                'last_modified': last_modified
+                            }
+                            print(f"Found suitable object: {bucket}/{key}, ETag: {version['ETag']}")
                             break
-        if len(suitable_objects) >= needed_objects:
+                        except Exception:
+                            # Not accessible via proxy, skip
+                            continue
+        if suitable_object:
             break
     
-    if len(suitable_objects) < needed_objects:
-        print(f"Warning: Found only {len(suitable_objects)} suitable objects, continuing with those")
-    
-    if not suitable_objects:
+    if not suitable_object:
         pytest.fail("Could not find any suitable objects for testing")
     
-    # 1. DELETE with If-Match using correct ETag should succeed
-    if suitable_objects:
-        obj = suitable_objects.pop(0)
-        print(f"\n1. Testing DELETE with If-Match=<correct-etag> for {bucket}/{obj['key']}")
-        try:
-            proxy_client.delete_object(
-                Bucket=bucket,
-                Key=obj['key'],
-                IfMatch=obj['etag']  # Origin ETag is correct for condition
-            )
-            print("✓ DELETE with correct If-Match succeeded")
-            
-            # Verify object appears deleted through proxy
-            try:
-                proxy_client.head_object(Bucket=bucket, Key=obj['key'])
-                pytest.fail("Object should appear deleted through proxy but still exists")
-            except botocore.exceptions.ClientError as e:
-                if '404' in str(e):
-                    print("✓ Object correctly appears deleted through proxy")
-                else:
-                    pytest.fail(f"Expected 404 for deleted object but got: {e}")
-                    
-            # Verify object still exists in origin (proxy only created a delete marker in overlay)
-            try:
-                origin_client.head_object(Bucket=bucket, Key=obj['key'])
-                print("✓ Object still exists in origin as expected")
-            except Exception as e:
-                pytest.fail(f"Object should still exist in origin but got error: {e}")
-        except botocore.exceptions.ClientError as e:
-            pytest.fail(f"DELETE with correct If-Match failed: {e}")
+    # Test that conditional DELETE requests return 501 Not Implemented
+    key = suitable_object['key']
+    etag = suitable_object['etag']
     
-    # 2. DELETE with If-Match using incorrect ETag should fail with 412
-    if suitable_objects:
-        obj = suitable_objects.pop(0)
-        print(f"\n2. Testing DELETE with If-Match=<incorrect-etag> for {bucket}/{obj['key']}")
-        incorrect_etag = '"00000000000000000000000000000000"'  # Obviously wrong ETag
+    # 1. DELETE with If-Match should return 501
+    print("\n1. Testing DELETE with If-Match (should return 501)")
+    try:
+        proxy_client.delete_object(
+            Bucket=bucket,
+            Key=key,
+            IfMatch=etag
+        )
+        pytest.fail("DELETE with If-Match should return 501 but succeeded")
+    except botocore.exceptions.ClientError as e:
+        if '501' in str(e) or 'NotImplemented' in str(e):
+            print("✓ DELETE with If-Match correctly returned 501 Not Implemented")
+        else:
+            pytest.fail(f"DELETE with If-Match returned wrong error: {e}")
+    
+    # 2. Skipping DELETE with If-None-Match test - not supported by boto3
+    # boto3 doesn't allow IfNoneMatch parameter for delete_object operations
+    
+    # 3. Regular DELETE without conditions should succeed
+    print("\n3. Testing regular DELETE without conditions (should succeed)")
+    try:
+        proxy_client.delete_object(
+            Bucket=bucket,
+            Key=key
+        )
+        print("✓ Regular DELETE without conditions succeeded")
+        
+        # Verify object appears deleted through proxy
         try:
-            proxy_client.delete_object(
-                Bucket=bucket,
-                Key=obj['key'],
-                IfMatch=incorrect_etag
-            )
-            pytest.fail("DELETE with incorrect If-Match should fail but succeeded")
+            proxy_client.head_object(Bucket=bucket, Key=key)
+            pytest.fail("Object should appear deleted through proxy but still exists")
         except botocore.exceptions.ClientError as e:
-            if '412' in str(e) or 'PreconditionFailed' in str(e):
-                print("✓ DELETE with incorrect If-Match correctly failed with 412")
+            if '404' in str(e):
+                print("✓ Object correctly appears deleted through proxy")
             else:
-                pytest.fail(f"DELETE with incorrect If-Match failed with wrong error: {e}")
+                pytest.fail(f"Expected 404 for deleted object but got: {e}")
+    except Exception as e:
+        pytest.fail(f"Regular DELETE without conditions failed: {e}")
     
-    # 3. DELETE with If-None-Match using non-matching ETag should succeed
-    if suitable_objects:
-        obj = suitable_objects.pop(0)
-        print(f"\n3. Testing DELETE with If-None-Match=<non-matching-etag> for {bucket}/{obj['key']}")
-        non_matching_etag = '"00000000000000000000000000000000"'  # Obviously non-matching ETag
-        try:
-            proxy_client.delete_object(
-                Bucket=bucket,
-                Key=obj['key'],
-                IfNoneMatch=non_matching_etag
-            )
-            print("✓ DELETE with non-matching If-None-Match succeeded")
-            
-            # Verify object appears deleted
-            try:
-                proxy_client.head_object(Bucket=bucket, Key=obj['key'])
-                pytest.fail("Object should appear deleted but still accessible")
-            except botocore.exceptions.ClientError as e:
-                if '404' in str(e):
-                    print("✓ Object correctly appears deleted")
-                else:
-                    pytest.fail(f"Expected 404 for deleted object but got: {e}")
-        except botocore.exceptions.ClientError as e:
-            pytest.fail(f"DELETE with non-matching If-None-Match failed: {e}")
-    
-    # 4. DELETE with If-None-Match using matching ETag should fail with 412
-    if suitable_objects:
-        obj = suitable_objects.pop(0)
-        print(f"\n4. Testing DELETE with If-None-Match=<matching-etag> for {bucket}/{obj['key']}")
-        try:
-            proxy_client.delete_object(
-                Bucket=bucket,
-                Key=obj['key'],
-                IfNoneMatch=obj['etag']  # Origin's ETag should match
-            )
-            pytest.fail("DELETE with matching If-None-Match should fail but succeeded")
-        except botocore.exceptions.ClientError as e:
-            if '412' in str(e) or 'PreconditionFailed' in str(e):
-                print("✓ DELETE with matching If-None-Match correctly failed with 412")
-            else:
-                pytest.fail(f"DELETE with matching If-None-Match failed with wrong error: {e}")
-    
-    # 5. DELETE with If-None-Match="*" should fail with 412 (since object exists)
-    if suitable_objects:
-        obj = suitable_objects.pop(0)
-        print(f"\n5. Testing DELETE with If-None-Match=* for {bucket}/{obj['key']}")
-        try:
-            proxy_client.delete_object(
-                Bucket=bucket,
-                Key=obj['key'],
-                IfNoneMatch="*"
-            )
-            pytest.fail('DELETE with If-None-Match="*" should fail but succeeded')
-        except botocore.exceptions.ClientError as e:
-            if '412' in str(e) or 'PreconditionFailed' in str(e):
-                print('✓ DELETE with If-None-Match="*" correctly failed with 412')
-            else:
-                pytest.fail(f'DELETE with If-None-Match="*" failed with wrong error: {e}')
-    
-    print("\nAll conditional DELETE operation tests completed!")
+    print("\nConditional DELETE operation tests completed!")
 
 def test_multiple_versions_before_start_time():
     """Test that the proxy correctly handles objects with multiple versions created before START_TIME"""

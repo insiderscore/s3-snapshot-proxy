@@ -187,9 +187,26 @@ def rewrite_overlay_path(original_path: str) -> str:
 async def handle_delete_workaround(overlay_url: str, overlay_headers: dict, body: bytes) -> httpx.Response:
     """
     Handle DELETE requests using a facilitator object.
-    1. Create a zero-length facilitator object with the header x-rtwa-delete-marker-facilitator.
-    2. Then delete that object so only a delete marker remains.
+    
+    1. Check if this is a conditional DELETE - if so, return 501 Not Implemented
+    2. Otherwise:
+       a. Create a zero-length facilitator object with the header x-rtwa-delete-marker-facilitator
+       b. Then delete that object so only a delete marker remains
     """
+    # First check if this is a conditional DELETE request
+    conditional_headers = ["if-match", "if-none-match", "if-modified-since", "if-unmodified-since"]
+    
+    for header in conditional_headers:
+        if header in {k.lower() for k in overlay_headers.keys()}:
+            logging.info("Conditional DELETE detected with header: %s. Returning 501 Not Implemented.", header)
+            # Return 501 Not Implemented for conditional DELETE operations
+            return httpx.Response(
+                status_code=501,
+                content=b"<Error><Code>NotImplemented</Code><Message>Conditional DELETE operations are not implemented</Message></Error>",
+                headers={"Content-Type": "application/xml"}
+            )
+    
+    # Standard DELETE operation - proceed with facilitator object pattern
     facilitator_headers = overlay_headers.copy()
     facilitator_headers["x-rtwa-delete-marker-facilitator"] = "true"
     logging.info("Creating facilitator object for deletion marker workaround: PUT %s", overlay_url)
@@ -841,7 +858,7 @@ async def handle_conditional_mutation(
     Handle conditional write (PUT) and delete (DELETE) requests that fail with 412 Precondition Failed.
     
     If the overlay returns 412 and the key doesn't exist in overlay:
-    1. Check if the condition would be satisfied against the origin object
+    1. Check if the condition would be satisfied against the origin object as of START_TIME
     2. If so, retry the request against overlay with modified conditions
     """
     if response.status_code != 412 or method not in {"PUT", "DELETE"}:
@@ -871,14 +888,38 @@ async def handle_conditional_mutation(
     # Check original request conditions against origin
     s3_client_origin = get_origin_s3_client()
     try:
-        # Get the origin object to check its metadata
-        origin_obj = s3_client_origin.head_object(Bucket=bucket, Key=key)
+        # We need to find the version of the object that was current at START_TIME,
+        # not just the current version
+        versions_response = s3_client_origin.list_object_versions(Bucket=bucket, Prefix=key)
         
+        # Find the most recent version that existed before START_TIME
+        candidate = None
+        candidate_time = None
+        if "Versions" in versions_response:
+            for ver in versions_response["Versions"]:
+                # Filter versions by START_TIME using our utility function
+                if filter_version_by_start_time(ver, START_TIME):
+                    if candidate is None or ver["LastModified"] > candidate_time:
+                        candidate = ver
+                        candidate_time = ver["LastModified"]
+        
+        # If no suitable version found, the object didn't exist at START_TIME
+        if candidate is None:
+            logging.info("No version of object existed at START_TIME, original 412 response is correct")
+            return response
+            
+        # Get the specific version's complete metadata for condition checking
+        version_id = candidate["VersionId"]
+        origin_obj = s3_client_origin.head_object(
+            Bucket=bucket, 
+            Key=key, 
+            VersionId=version_id
+        )
+        
+        # Now check conditions against this point-in-time correct version
         # Extract relevant conditions from original headers
         if_match = original_headers.get("if-match")
         if_none_match = original_headers.get("if-none-match")
-        if_modified_since = original_headers.get("if-modified-since")
-        if_unmodified_since = original_headers.get("if-unmodified-since")
         
         # Check if the origin object satisfies these conditions
         satisfied = True
@@ -893,53 +934,25 @@ async def handle_conditional_mutation(
         if if_none_match and satisfied:
             etags = [tag.strip(' "') for tag in if_none_match.split(",")]
             origin_etag = origin_obj.get("ETag", "").strip('"')
-            if origin_etag in etags or "*" in etags:
-                satisfied = False
-        
-        # Check time-based conditions
-        if if_modified_since and satisfied:
-            try:
-                modified_since = datetime.strptime(
-                    if_modified_since, "%a, %d %b %Y %H:%M:%S GMT"
-                ).replace(tzinfo=timezone.utc)
-                last_modified = origin_obj.get("LastModified")
-                if last_modified <= modified_since:
-                    satisfied = False
-            except ValueError:
-                # Invalid date format
+            key_exists = True  # The key exists in origin if we got here
+            if origin_etag in etags or "*" in etags and key_exists:
                 satisfied = False
                 
-        if if_unmodified_since and satisfied:
-            try:
-                unmodified_since = datetime.strptime(
-                    if_unmodified_since, "%a, %d %b %Y %H:%M:%S GMT"
-                ).replace(tzinfo=timezone.utc)
-                last_modified = origin_obj.get("LastModified")
-                if last_modified > unmodified_since:
-                    satisfied = False
-            except ValueError:
-                # Invalid date format
-                satisfied = False
-        
         # If origin would satisfy the conditions, retry against overlay with simplified condition
         if satisfied:
-            logging.info("Origin object satisfies the original conditions. Retrying with If-None-Match: *")
+            logging.info("Origin object at START_TIME satisfies the original conditions. Retrying with If-None-Match: *")
             # Create new headers without the original conditions
             modified_headers = {k: v for k, v in original_headers.items() 
-                               if k.lower() not in {"if-match", "if-none-match", 
-                                                   "if-modified-since", "if-unmodified-since"}}
+                               if k.lower() not in {"if-match", "if-none-match"}}
             # Add condition that will allow write if object doesn't exist in overlay
             modified_headers["If-None-Match"] = "*"
             
             overlay_path = rewrite_overlay_path(full_path)
             overlay_url = f"{OVERLAY_S3_URL}/{quote(overlay_path)}"
             
-            if method == "DELETE":
-                new_response = await handle_delete_workaround(overlay_url, modified_headers, body)
-            else:
-                new_response = await signed_client.request(
-                    method, overlay_url, headers=modified_headers, content=body
-                )
+            new_response = await signed_client.request(
+                method, overlay_url, headers=modified_headers, content=body
+            )
             
             logging.info("Conditional retry status: %s", new_response.status_code)
             return new_response
