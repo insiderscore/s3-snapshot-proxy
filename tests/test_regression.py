@@ -559,15 +559,12 @@ def test_point_in_time_conditional():
     bucket = "origin-bucket1"
     
     # Find an existing object that was created before START_TIME
-    # The origin buckets were populated during container startup, before our tests run
     print("Finding an existing object created before START_TIME...")
     
     paginator = origin_client.get_paginator("list_object_versions")
-    before_key = None
-    before_etag = None
     
-    # Make sure we're using an object that doesn't yet exist in overlay
-    found_suitable_object = False
+    # Track all versions for each key that's before START_TIME
+    candidates = {}
     
     for page in paginator.paginate(Bucket=bucket):
         if 'Versions' in page:
@@ -575,30 +572,52 @@ def test_point_in_time_conditional():
                 key = version['Key']
                 last_modified = version['LastModified']
                 
-                # Find an object created before START_TIME
+                # Find objects with versions before START_TIME
                 if last_modified < start_time:
-                    # Check if this object exists in overlay bucket
-                    overlay_path = f"{bucket}/{key}"
-                    try:
-                        # Try to access it directly through the overlay S3 endpoint
-                        overlay_client = boto3.client(
-                            "s3",
-                            endpoint_url=health_data.get('overlayS3', "http://minio-overlay:9000"),
-                            aws_access_key_id="overlay-access",
-                            aws_secret_access_key="overlay-secret"
-                        )
-                        overlay_client.head_object(Bucket=health_data.get('overlayBucket', 'overlay'), Key=overlay_path)
-                        # Object exists in overlay, skip it
-                        continue
-                    except Exception:
-                        # Object doesn't exist in overlay, good candidate
-                        before_key = key
-                        before_etag = version['ETag']
-                        found_suitable_object = True
-                        print(f"Found suitable object created before START_TIME: {bucket}/{before_key}")
-                        print(f"Last modified: {last_modified}, ETag: {before_etag}")
-                        break
-        if found_suitable_object:
+                    if key not in candidates:
+                        candidates[key] = []
+                    
+                    candidates[key].append({
+                        'LastModified': last_modified,
+                        'ETag': version['ETag'],
+                        'Key': key
+                    })
+    
+    # Find a suitable object (exists before START_TIME, not in overlay)
+    found_suitable_object = False
+    before_key = None
+    before_etag = None
+    
+    # Sort candidates by number of versions (prefer objects with multiple versions for better testing)
+    sorted_keys = sorted(candidates.keys(), key=lambda k: len(candidates[k]), reverse=True)
+    
+    for key in sorted_keys:
+        # Sort versions by LastModified (newest first)
+        versions = sorted(candidates[key], key=lambda v: v['LastModified'], reverse=True)
+        
+        # Use newest version before START_TIME
+        newest_version = versions[0]
+        
+        # Check if this object exists in overlay bucket
+        overlay_path = f"{bucket}/{key}"
+        try:
+            overlay_client = boto3.client(
+                "s3",
+                endpoint_url=health_data.get('overlayS3', "http://minio-overlay:9000"),
+                aws_access_key_id="overlay-access",
+                aws_secret_access_key="overlay-secret"
+            )
+            overlay_client.head_object(Bucket=health_data.get('overlayBucket', 'overlay'), Key=overlay_path)
+            # Object exists in overlay, skip it
+            continue
+        except Exception:
+            # Object doesn't exist in overlay, good candidate
+            before_key = key
+            before_etag = newest_version['ETag']
+            found_suitable_object = True
+            print(f"Found suitable object created before START_TIME: {bucket}/{before_key}")
+            print(f"Last modified: {newest_version['LastModified']}, ETag: {before_etag}")
+            print(f"Total versions before START_TIME: {len(versions)}")
             break
             
     if not found_suitable_object:
@@ -716,7 +735,7 @@ def test_conditional_delete_operations():
                             aws_secret_access_key="overlay-secret"
                         )
                         overlay_client.head_object(Bucket=health_data.get('overlayBucket', 'overlay'), Key=overlay_path)
-                        # Object exists in overlay, skip it
+                        # Object exists in overlay, skip
                         continue
                     except Exception:
                         # Good candidate - save the object info
