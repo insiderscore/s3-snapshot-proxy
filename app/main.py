@@ -930,14 +930,20 @@ async def handle_conditional_mutation(
             origin_etag = origin_obj.get("ETag", "").strip('"')
             if origin_etag not in etags and "*" not in etags:
                 satisfied = False
+                logging.info(f"If-Match condition not satisfied: {if_match} vs origin ETag {origin_etag}")
                 
         if if_none_match and satisfied:
             etags = [tag.strip(' "') for tag in if_none_match.split(",")]
             origin_etag = origin_obj.get("ETag", "").strip('"')
-            key_exists = True  # The key exists in origin if we got here
-            if origin_etag in etags or "*" in etags and key_exists:
+            key_exists = True  # We know the key exists in origin if we got here
+            
+            # For If-None-Match, the condition is NOT satisfied if:
+            # 1. Any specified ETag matches the current ETag, OR
+            # 2. "*" is specified and the object exists
+            if origin_etag in etags or ("*" in etags and key_exists):
                 satisfied = False
-                
+                logging.info(f"If-None-Match condition not satisfied: {if_none_match} vs origin ETag {origin_etag}")
+        
         # If origin would satisfy the conditions, retry against overlay with simplified condition
         if satisfied:
             logging.info("Origin object at START_TIME satisfies the original conditions. Retrying with If-None-Match: *")
