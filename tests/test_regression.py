@@ -195,6 +195,9 @@ def test_proxy(scale_factor):
     # Add our new conditional delete test
     test_conditional_delete_operations()
 
+    # Add our new multiple versions test
+    test_multiple_versions_before_start_time()
+
 def test_conditional_requests(scale_factor):
     """Test conditional requests against the S3 overlay proxy"""
     print("Testing conditional request handling...")
@@ -843,6 +846,144 @@ def test_conditional_delete_operations():
                 pytest.fail(f'DELETE with If-None-Match="*" failed with wrong error: {e}')
     
     print("\nAll conditional DELETE operation tests completed!")
+
+def test_multiple_versions_before_start_time():
+    """Test that the proxy correctly handles objects with multiple versions created before START_TIME"""
+    print("\n=== Testing Multiple Versions Before START_TIME ===\n")
+    
+    # Set up clients as in previous tests
+    origin_client = boto3.client(
+        "s3",
+        endpoint_url="http://minio-origin:9000",
+        aws_access_key_id="origin-access",
+        aws_secret_access_key="origin-secret"
+    )
+    proxy_client = boto3.client(
+        "s3",
+        endpoint_url="http://s3proxy:9000",
+        aws_access_key_id="origin-access",
+        aws_secret_access_key="origin-secret"
+    )
+    
+    # Get START_TIME
+    health_url = f"http://s3proxy:9000/health"
+    response = requests.get(health_url)
+    health_data = response.json()
+    start_time = datetime.fromisoformat(health_data['startTime'])
+    
+    bucket = "origin-bucket1"
+    
+    # Create a test object with multiple versions, all before START_TIME
+    # We'll need to adjust the LastModified timestamps manually in origin S3
+    # or set up test data that we know has multiple versions
+    
+    # Find objects that have multiple versions before START_TIME
+    paginator = origin_client.get_paginator("list_object_versions")
+    multi_version_candidates = {}
+    
+    for page in paginator.paginate(Bucket=bucket):
+        if 'Versions' in page:
+            for version in page['Versions']:
+                key = version['Key']
+                last_modified = version['LastModified']
+                
+                # Track objects with versions before START_TIME
+                if last_modified < start_time:
+                    if key not in multi_version_candidates:
+                        multi_version_candidates[key] = []
+                    
+                    multi_version_candidates[key].append({
+                        'VersionId': version['VersionId'],
+                        'LastModified': last_modified,
+                        'ETag': version['ETag']
+                    })
+    
+    # Find objects with multiple versions before START_TIME and not in overlay
+    suitable_objects = []
+    
+    for key, versions in multi_version_candidates.items():
+        if len(versions) >= 2:  # At least 2 versions before START_TIME
+            # Sort versions by LastModified (newest first)
+            versions.sort(key=lambda x: x['LastModified'], reverse=True)
+            
+            # Check if object exists in overlay
+            overlay_path = f"{bucket}/{key}"
+            try:
+                overlay_client = boto3.client(
+                    "s3",
+                    endpoint_url=health_data.get('overlayS3', "http://minio-overlay:9000"),
+                    aws_access_key_id="overlay-access",
+                    aws_secret_access_key="overlay-secret"
+                )
+                overlay_client.head_object(Bucket=health_data.get('overlayBucket', 'overlay'), Key=overlay_path)
+                # Exists in overlay, skip
+                continue
+            except Exception:
+                # Good candidate - doesn't exist in overlay
+                suitable_objects.append({
+                    'key': key,
+                    'versions': versions
+                })
+                print(f"Found object with {len(versions)} versions before START_TIME: {bucket}/{key}")
+                if len(suitable_objects) >= 3:  # Find a few candidates
+                    break
+    
+    if not suitable_objects:
+        pytest.skip("No objects with multiple pre-START_TIME versions found. Skipping test.")
+    
+    # Test with the first suitable object
+    test_obj = suitable_objects[0]
+    key = test_obj['key']
+    versions = test_obj['versions']
+    
+    # The newest version before START_TIME
+    newest_version = versions[0]
+    # An older version before START_TIME
+    older_version = versions[1]
+    
+    print(f"Testing with object {bucket}/{key}")
+    print(f"Newest version: {newest_version['LastModified']}, ETag: {newest_version['ETag']}")
+    print(f"Older version: {older_version['LastModified']}, ETag: {older_version['ETag']}")
+    
+    # 1. Verify proxy returns content from newest version before START_TIME
+    proxy_response = proxy_client.get_object(Bucket=bucket, Key=key)
+    proxy_etag = proxy_response['ETag']
+    
+    assert proxy_etag == newest_version['ETag'], \
+        f"Proxy should return newest version ({newest_version['ETag']}) but got {proxy_etag}"
+    print("✓ Proxy correctly returns newest version before START_TIME")
+    
+    # 2. Test conditional operations work with newest version's ETag
+    # PUT with If-Match=newest_version ETag should succeed
+    try:
+        test_content = f"Updated via proxy with If-Match newest_etag: {datetime.now().isoformat()}"
+        proxy_client.put_object(
+            Bucket=bucket, 
+            Key=key, 
+            Body=test_content,
+            IfMatch=newest_version['ETag']
+        )
+        print("✓ If-Match with newest version's ETag succeeded (correct)")
+    except botocore.exceptions.ClientError as e:
+        pytest.fail(f"If-Match with newest version's ETag should succeed but failed: {e}")
+    
+    # 3. Test conditional operations fail with older version's ETag
+    # PUT with If-Match=older_version ETag should fail with 412
+    try:
+        proxy_client.put_object(
+            Bucket=bucket, 
+            Key=key, 
+            Body="This update should fail",
+            IfMatch=older_version['ETag']
+        )
+        pytest.fail("If-Match with older version's ETag should fail but succeeded")
+    except botocore.exceptions.ClientError as e:
+        if '412' in str(e) or 'PreconditionFailed' in str(e):
+            print("✓ If-Match with older version's ETag correctly failed with 412")
+        else:
+            pytest.fail(f"If-Match with older version's ETag failed with wrong error: {e}")
+    
+    print("Multiple version test passed!")
 
 if __name__ == "__main__":
     # Parse command-line arguments
