@@ -603,19 +603,22 @@ def test_point_in_time_conditional():
     # 3. Test conditional operations using both ETags
     
     # 3.1 If-Match with 'before' ETag should succeed through proxy
+    # Note: Since we haven't created the object in overlay yet,
+    # the origin's ETag is the correct one to use
     try:
         test_content = f"Updated via proxy with If-Match before_etag: {datetime.now().isoformat()}"
         proxy_client.put_object(
             Bucket=bucket, 
             Key=before_key, 
             Body=test_content,
-            IfMatch=before_etag
+            IfMatch=before_etag  # This is correct as the object isn't in overlay yet
         )
         print("✓ If-Match with 'before' ETag succeeded (correct)")
         
-        # Verify content was updated
+        # For subsequent operations, we'd need to use the overlay ETag
         updated_response = proxy_client.get_object(Bucket=bucket, Key=before_key)
         updated_content = updated_response['Body'].read().decode('utf-8')
+        overlay_etag = updated_response['ETag']  # Get overlay ETag for future operations
         assert test_content in updated_content, "Content should have been updated"
     except botocore.exceptions.ClientError as e:
         pytest.fail(f"If-Match with 'before' ETag should succeed but failed: {e}")
