@@ -55,3 +55,9 @@ Compatible handling of DELETE requests
   DELETE requests return 501. On minio, preconditions on DELETE requests
   are silently ignored. Our proxy should not forward conditional DELETE
   requests and instead return 501.
+
+- For standard versioned buckets on a real Amazon S3 endpoint, the only
+  If-None-Match value supported for conditional PUT requests is '*',
+  which requires that a non-deleted version of the object must not
+  already exist. 
+
