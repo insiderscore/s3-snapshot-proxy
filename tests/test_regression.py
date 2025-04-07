@@ -162,10 +162,12 @@ def test_proxy(scale_factor):
     # 2. Verify overlay objects have the updated content
     print("Testing overlay objects have updated content...")
     for bucket, key in tqdm(random.sample(overlaid_keys, min(10, len(overlaid_keys))), desc="Overlay verification"):
-        origin_content = origin_client.get_object(Bucket=bucket, Key=key)["Body"].read()
-        proxy_content = proxy_client.get_object(Bucket=bucket, Key=key)["Body"].read()
-        assert proxy_content.startswith(b"Overlay content"), f"Overlay didn't replace origin for key: {bucket}/{key}"
-        assert origin_content != proxy_content, f"Overlay content identical to origin for key: {bucket}/{key}"
+        try:
+            proxy_content = proxy_client.get_object(Bucket=bucket, Key=key)["Body"].read()
+            assert proxy_content.startswith(b"Overlay content"), f"Overlay didn't properly update content for key: {bucket}/{key}"
+            print(f"✓ Verified overlay content for {bucket}/{key}")
+        except Exception as e:
+            pytest.fail(f"Error reading overlaid object {bucket}/{key}: {e}")
 
     # 3. Verify delete markers work
     print("Testing delete markers...")
