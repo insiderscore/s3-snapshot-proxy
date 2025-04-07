@@ -1068,35 +1068,6 @@ async def proxy(full_path: str, request: Request):
         response = await signed_client.request(method, overlay_url, headers=overlay_headers, content=body)
         logging.info("Overlay response status: %s, headers: %s", response.status_code, dict(response.headers))
     
-    # Handle the special case of If-None-Match: * for PUT requests that succeed against overlay
-    if method == "PUT" and original_headers.get("if-none-match") == "*" and response.status_code == 200:
-        # Here the request succeeded against overlay, meaning nothing exists in overlay
-        # We still need to check if object existed in origin at START_TIME
-        parts = full_path.split('/', 1)
-        bucket = parts[0]
-        key = parts[1] if len(parts) > 1 else ""
-        
-        try:
-            origin_obj = check_object_at_start_time(bucket, key)
-            if origin_obj:
-                # Object exists in origin at START_TIME, PUT should have failed with 412
-                logging.info(f"If-None-Match: * condition not satisfied - object exists in origin at START_TIME: {bucket}/{key}")
-                # Delete the object we just created in overlay
-                try:
-                    overlay_path = f"{bucket}/{key}"
-                    s3_client_overlay.delete_object(Bucket=OVERLAY_BUCKET, Key=overlay_path)
-                    logging.info(f"Cleaned up incorrectly created object in overlay: {overlay_path}")
-                except Exception as e:
-                    logging.error(f"Failed to clean up incorrectly created object: {e}")
-                
-                return Response(
-                    content=b"<Error><Code>PreconditionFailed</Code><Message>At least one of the pre-conditions you specified did not hold</Message></Error>",
-                    status_code=412,
-                    headers={"Content-Type": "application/xml"}
-                )
-        except Exception as e:
-            logging.warning(f"Error checking origin for If-None-Match: * condition: {e}")
-    
     # For GET/HEAD, if the overlay response includes the facilitator header, treat it as delete marker.
     if method in {"GET", "HEAD"} and response.headers.get("x-rtwa-delete-marker-facilitator", "false").lower() == "true":
         logging.info("Overlay response includes facilitator header; treating as delete marker (404)")
