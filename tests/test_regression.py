@@ -185,21 +185,9 @@ def test_proxy(scale_factor):
 
     print("Proxy test passed! All behaviors verified.")
 
-    # Add after all other tests
-    print("\n=== Testing Conditional Requests ===\n")
-    test_conditional_requests(scale_factor)
-
-    # Add our new point-in-time test
-    test_point_in_time_conditional()
-
-    # Add our new conditional delete test
-    test_conditional_delete_operations()
-
-    # Add our new multiple versions test
-    test_multiple_versions_before_start_time()
-
 def test_conditional_requests(scale_factor):
     """Test conditional requests against the S3 overlay proxy"""
+    print("\n=== Testing Conditional Requests ===\n")
     print("Testing conditional request handling...")
     
     # Set up clients
