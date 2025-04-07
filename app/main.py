@@ -972,6 +972,49 @@ async def handle_conditional_mutation(
     # Default: return the original 412 response
     return response
 
+def check_object_at_start_time(bucket: str, key: str):
+    """
+    Check if an object existed in origin at START_TIME and return its metadata.
+    Returns None if the object didn't exist at START_TIME.
+    """
+    s3_client_origin = get_origin_s3_client()
+    try:
+        # List versions to find the one that was current at START_TIME
+        versions_response = s3_client_origin.list_object_versions(Bucket=bucket, Prefix=key)
+        
+        # Find the most recent version that existed before START_TIME
+        candidate = None
+        candidate_time = None
+        if "Versions" in versions_response:
+            for ver in versions_response["Versions"]:
+                # Only consider exact key matches (prefix could return other keys)
+                if ver["Key"] != key:
+                    continue
+                    
+                # Only consider versions before START_TIME
+                if filter_version_by_start_time(ver, START_TIME):
+                    # Keep the version if it's the first one found or newer than what we have
+                    if candidate is None or ver["LastModified"] > candidate_time:
+                        candidate = ver
+                        candidate_time = ver["LastModified"]
+        
+        # If no suitable version found, the object didn't exist at START_TIME
+        if candidate is None:
+            return None
+            
+        # Get the specific version's complete metadata
+        version_id = candidate["VersionId"]
+        origin_obj = s3_client_origin.head_object(
+            Bucket=bucket, 
+            Key=key, 
+            VersionId=version_id
+        )
+        
+        return origin_obj
+        
+    except Exception as e:
+        logging.info(f"Error checking object at START_TIME: {str(e)}")
+        return None
 
 async def handle_if_none_match_star_put(
     full_path: str, original_headers: dict
@@ -984,6 +1027,9 @@ async def handle_if_none_match_star_put(
     bucket = parts[0]
     key = parts[1] if len(parts) > 1 else ""
     overlay_path = f"{bucket}/{key}"
+    
+    # Initialize the overlay S3 client
+    s3_client_overlay = get_overlay_s3_client()
     
     # First check if object exists in overlay
     try:
