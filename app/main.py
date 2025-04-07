@@ -658,9 +658,7 @@ async def list_objects_handler(bucket: str, request: Request, prefix: str = ""):
         origin_params = {"Bucket": bucket, "Prefix": prefix or ""}
         if delimiter:
             origin_params["Delimiter"] = delimiter
-        # Note: We can't use continuation_token here since list_object_versions uses different pagination
-            
-        logging.info("Origin query parameters: %s", origin_params)
+        # Note: We can't use continuation_token here since list_object_versions uses different pagination      
         
         # Paginate through all object versions
         is_truncated = True
@@ -668,7 +666,8 @@ async def list_objects_handler(bucket: str, request: Request, prefix: str = ""):
         version_id_marker = None
 
         while is_truncated:
-            origin_params = {"Bucket": bucket, "Prefix": prefix or ""}
+            logging.info("Fetching paginated result for ListObjectVersions params: %s", origin_params)
+            # origin_params = {"Bucket": bucket, "Prefix": prefix or ""}
             if key_marker:
                 origin_params["KeyMarker"] = key_marker
                 origin_params["VersionIdMarker"] = version_id_marker
