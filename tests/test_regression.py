@@ -1049,6 +1049,281 @@ def test_multiple_versions_before_start_time():
     
     print("Multiple version test passed!")
 
+def test_list_objects_v2_with_delete_markers():
+    """Test that ListObjectsV2 correctly hides objects with delete markers from before START_TIME"""
+    print("\n=== Testing ListObjectsV2 with Delete Markers ===\n")
+    
+    # Set up clients
+    origin_client = boto3.client(
+        "s3",
+        endpoint_url="http://minio-origin:9000",
+        aws_access_key_id="origin-access",
+        aws_secret_access_key="origin-secret"
+    )
+    proxy_client = boto3.client(
+        "s3",
+        endpoint_url="http://s3proxy:9000",
+        aws_access_key_id="origin-access",
+        aws_secret_access_key="origin-secret"
+    )
+    
+    # Get the proxy's START_TIME and overlay bucket info
+    health_url = "http://s3proxy:9000/health"
+    response = requests.get(health_url)
+    health_data = response.json()
+    start_time = datetime.fromisoformat(health_data['startTime'])
+    overlay_bucket = health_data.get('overlayBucket', 'overlay')
+    overlay_s3_url = health_data.get('overlayS3', 'http://minio-overlay:9000')
+    print(f"Proxy START_TIME is: {start_time}")
+    print(f"Overlay bucket: {overlay_bucket}")
+    
+    # Set up overlay client to check for superseding versions
+    overlay_client = boto3.client(
+        "s3",
+        endpoint_url=overlay_s3_url,
+        aws_access_key_id="overlay-access",
+        aws_secret_access_key="overlay-secret"
+    )
+    
+    bucket = "origin-bucket1"
+    prefix = "test-deleted-before-start/"
+    
+    # First, verify that our special test objects were created correctly
+    # They should have delete markers before START_TIME and not be accessible
+    print("\nVerifying test objects were prepared correctly...")
+    
+    # 1. Check objects don't exist via proxy (should return 404)
+    for test_key in ["test-deleted-before-start/object1", "test-deleted-before-start/object2"]:
+        # First check if there's a superseding version in overlay
+        overlay_path = f"{bucket}/{test_key}"
+        has_overlay_version = False
+        try:
+            overlay_client.head_object(Bucket=overlay_bucket, Key=overlay_path)
+            has_overlay_version = True
+            print(f"⚠️ Object {test_key} has a superseding version in overlay, skipping this test case")
+        except Exception:
+            # No overlay version, we can proceed with the test
+            pass
+            
+        if not has_overlay_version:
+            try:
+                proxy_client.head_object(Bucket=bucket, Key=test_key)
+                pytest.fail(f"Object {test_key} should be deleted but is accessible")
+            except botocore.exceptions.ClientError as e:
+                if '404' in str(e):
+                    print(f"✓ Object {test_key} correctly shows as deleted")
+                else:
+                    pytest.fail(f"Expected 404 for {test_key} but got: {e}")
+    
+    # 2. Verify that objects with multiple versions but delete marker before START_TIME
+    # also don't appear
+    for test_key in ["test-multi-version-deleted/object1", "test-multi-version-deleted/object2"]:
+        # Check for overlay version first
+        overlay_path = f"{bucket}/{test_key}"
+        has_overlay_version = False
+        try:
+            overlay_client.head_object(Bucket=overlay_bucket, Key=overlay_path)
+            has_overlay_version = True
+            print(f"⚠️ Object {test_key} has a superseding version in overlay, skipping this test case")
+        except Exception:
+            # No overlay version, we can proceed with the test
+            pass
+            
+        if not has_overlay_version:
+            try:
+                proxy_client.head_object(Bucket=bucket, Key=test_key)
+                pytest.fail(f"Object {test_key} should be deleted but is accessible")
+            except botocore.exceptions.ClientError as e:
+                if '404' in str(e):
+                    print(f"✓ Multi-version object {test_key} correctly shows as deleted")
+                else:
+                    pytest.fail(f"Expected 404 for multi-version {test_key} but got: {e}")
+    
+    # 3. Now verify the ListObjectsV2 behavior - objects with delete markers
+    # before START_TIME should not appear in listing
+    
+    # Test with specific prefixes that we know have deleted objects
+    print("\nTesting ListObjectsV2 with prefix containing deleted objects...")
+    
+    # ListObjectsV2 for test-deleted-before-start/ prefix
+    response = proxy_client.list_objects_v2(
+        Bucket=bucket,
+        Prefix="test-deleted-before-start/"
+    )
+    
+    # Should not return any objects
+    objects_returned = []
+    if 'Contents' in response:
+        objects_returned = [item['Key'] for item in response['Contents']]
+    
+    print(f"ListObjectsV2 returned {len(objects_returned)} objects for deleted prefix")
+    
+    # Verify none of our test objects appear in the listing
+    for test_key in ["test-deleted-before-start/object1", "test-deleted-before-start/object2"]:
+        # Check overlay first
+        overlay_path = f"{bucket}/{test_key}"
+        has_overlay_version = False
+        try:
+            overlay_client.head_object(Bucket=overlay_bucket, Key=overlay_path)
+            has_overlay_version = True
+            print(f"⚠️ Object {test_key} has a superseding version in overlay, skipping this assertion")
+        except Exception:
+            # No overlay version, we can proceed with the assertion
+            pass
+            
+        if not has_overlay_version:
+            assert test_key not in objects_returned, f"Deleted object {test_key} incorrectly appears in ListObjectsV2"
+        
+    print("✓ Deleted objects correctly don't appear in ListObjectsV2")
+    
+    # Test with multi-version deleted objects
+    response = proxy_client.list_objects_v2(
+        Bucket=bucket,
+        Prefix="test-multi-version-deleted/"
+    )
+    
+    # Should not return any objects
+    objects_returned = []
+    if 'Contents' in response:
+        objects_returned = [item['Key'] for item in response['Contents']]
+    
+    print(f"ListObjectsV2 returned {len(objects_returned)} objects for multi-version deleted prefix")
+    
+    # Verify none of our test objects appear in the listing
+    for test_key in ["test-multi-version-deleted/object1", "test-multi-version-deleted/object2"]:
+        # Check overlay first
+        overlay_path = f"{bucket}/{test_key}"
+        has_overlay_version = False
+        try:
+            overlay_client.head_object(Bucket=overlay_bucket, Key=overlay_path)
+            has_overlay_version = True
+            print(f"⚠️ Object {test_key} has a superseding version in overlay, skipping this assertion")
+        except Exception:
+            # No overlay version, we can proceed with the assertion
+            pass
+            
+        if not has_overlay_version:
+            assert test_key not in objects_returned, f"Multi-version deleted object {test_key} incorrectly appears in ListObjectsV2"
+        
+    print("✓ Multi-version deleted objects correctly don't appear in ListObjectsV2")
+    
+    # 4. Compare with objects that should be visible
+    # For this we'll use the broader test data created in populate_origin.py
+    print("\nComparing to a broader set of objects...")
+    
+    # Get list of objects in origin
+    origin_keys_with_history = {}  # Key -> list of version info
+    
+    # Get all versions and delete markers
+    paginator = origin_client.get_paginator('list_object_versions')
+    
+    # Use a small common prefix to limit results but still get meaningful data
+    common_prefix = "origin/a"  # Should match some of our randomly generated keys
+    
+    for page in paginator.paginate(Bucket=bucket, Prefix=common_prefix):
+        # Track object versions
+        if 'Versions' in page:
+            for version in page['Versions']:
+                key = version['Key']
+                if key not in origin_keys_with_history:
+                    origin_keys_with_history[key] = []
+                
+                origin_keys_with_history[key].append({
+                    'LastModified': version['LastModified'],
+                    'VersionId': version['VersionId'],
+                    'IsDeleteMarker': False,
+                })
+            
+        # Track delete markers
+        if 'DeleteMarkers' in page:
+            for dm in page['DeleteMarkers']:
+                key = dm['Key']
+                if key not in origin_keys_with_history:
+                    origin_keys_with_history[key] = []
+                
+                origin_keys_with_history[key].append({
+                    'LastModified': dm['LastModified'],
+                    'VersionId': dm['VersionId'],
+                    'IsDeleteMarker': True,
+                })
+    
+    # Now determine visibility based on version history
+    # A key is not visible if its latest version before START_TIME is a delete marker
+    should_be_hidden = set()
+    should_be_visible = set()
+    
+    for key, history in origin_keys_with_history.items():
+        # Check if there's a superseding version in overlay
+        overlay_path = f"{bucket}/{key}"
+        has_overlay_version = False
+        try:
+            overlay_client.head_object(Bucket=overlay_bucket, Key=overlay_path)
+            has_overlay_version = True
+            # Skip objects that have been modified in overlay
+            continue
+        except Exception:
+            # No overlay version, we can proceed with analyzing this object
+            pass
+            
+        if has_overlay_version:
+            continue  # Skip this key since it has been modified in overlay
+        
+        # Sort versions by LastModified time (newest first)
+        history_before_start = [v for v in history if v['LastModified'] < start_time]
+        if not history_before_start:
+            continue
+            
+        # Sort by timestamp, newest first
+        history_before_start.sort(key=lambda x: x['LastModified'], reverse=True)
+        
+        # Check the latest version before START_TIME
+        latest_version = history_before_start[0]
+        
+        if latest_version['IsDeleteMarker']:
+            # If latest version is a delete marker, the key should be hidden
+            should_be_hidden.add(key)
+        else:
+            # If latest version is a regular version, the key should be visible
+            should_be_visible.add(key)
+    
+    print(f"Found {len(origin_keys_with_history)} keys with prefix '{common_prefix}'")
+    print(f"Of these, {len(should_be_hidden)} should be hidden (latest version is a delete marker)")
+    print(f"And {len(should_be_visible)} should be visible (latest version is not a delete marker)")
+    print(f"Note: Keys with superseding versions in overlay were excluded from analysis")
+    
+    # Get ListObjectsV2 results from proxy
+    proxy_response = proxy_client.list_objects_v2(
+        Bucket=bucket,
+        Prefix=common_prefix
+    )
+    
+    proxy_objects = []
+    if 'Contents' in proxy_response:
+        proxy_objects = [item['Key'] for item in proxy_response['Contents']]
+    
+    print(f"ListObjectsV2 via proxy returned {len(proxy_objects)} objects")
+    
+    # Verify keys that should be hidden are not in the listing
+    for key in should_be_hidden:
+        assert key not in proxy_objects, f"Key {key} with latest version as delete marker incorrectly appears in ListObjectsV2"
+    
+    print("✓ All objects with latest version as delete marker are correctly hidden in ListObjectsV2")
+    
+    # Verify keys that should be visible appear in the listing (test a sample)
+    sample_size = min(5, len(should_be_visible))
+    if sample_size > 0:
+        sampled_keys = random.sample(list(should_be_visible), sample_size)
+        for key in sampled_keys:
+            try:
+                proxy_client.head_object(Bucket=bucket, Key=key)
+                print(f"✓ Object {key} is correctly accessible via HEAD")
+                assert key in proxy_objects, f"Key {key} should appear in ListObjectsV2 but doesn't"
+                print(f"✓ Object {key} correctly appears in listing")
+            except Exception as e:
+                pytest.fail(f"Object {key} should be accessible but got: {e}")
+    
+    print("ListObjectsV2 delete marker visibility test passed!")
+
 if __name__ == "__main__":
     # Parse command-line arguments
     parser = argparse.ArgumentParser(description="Run S3 proxy regression tests.")
