@@ -224,42 +224,43 @@ async def handle_precondition_failure(
     method: str, full_path: str, original_headers: dict, body: bytes, response: httpx.Response
 ) -> httpx.Response:
     """
-    If the origin request returns a 412 Precondition Failed, use ListObjectVersions to determine whether
-    a version of the object existed before START_TIME. If found, append the versionId as a subresource 
-    to the object path and retry the request.
+    Handle precondition failures by checking object state at START_TIME
     """
     if response.status_code != 412:
         return response
 
-    # Parse bucket and key from full_path (assumes format "bucket/key")
+    # Parse bucket and key from full_path
     parts = full_path.strip("/").split("/", 1)
     if len(parts) == 2:
         bucket, key = parts
     else:
         bucket, key = parts[0], ""
+        
+    # Parse out any existing query parameters
+    key_parts = key.split("?", 1)
+    base_key = key_parts[0]
+    query_params = key_parts[1] if len(key_parts) > 1 else ""
 
-    logging.info("Received 412. Listing object versions for bucket: %s, key: %s", bucket, key)
-    # Use the proper client with correct credentials and endpoint
-    s3_client = get_origin_s3_client()
-    versions_response = s3_client.list_object_versions(Bucket=bucket, Prefix=key)
+    logging.info("Received 412. Checking object state at START_TIME for: %s, key: %s", bucket, base_key)
     
-    candidate = None
-    candidate_time = None
-    if "Versions" in versions_response:
-        for ver in versions_response["Versions"]:
-            # Use our factored function instead of repeating the condition
-            if filter_version_by_start_time(ver, START_TIME):
-                if candidate is None or ver["LastModified"] > candidate_time:
-                    candidate = ver
-                    candidate_time = ver["LastModified"]
-
-    if candidate is None:
-        logging.info("No matching version found for key %s before START_TIME. Returning 404.", key)
+    # Use our comprehensive function that properly handles delete markers and pagination
+    origin_obj = check_object_at_start_time(bucket, base_key)
+    
+    if origin_obj is None:
+        logging.info("No matching version found for key %s before START_TIME. Returning 404.", base_key)
         return httpx.Response(status_code=404, content=b"")
 
-    version_id = candidate["VersionId"]
+    version_id = origin_obj.get("VersionId")
     logging.info("Found version %s. Retrying origin request with version subresource.", version_id)
-    origin_url = f"{ORIGIN_S3_URL}/{quote(full_path)}?versionId={version_id}"
+    
+    # Properly reconstruct URL with query parameters
+    if query_params:
+        # If there are existing query params, add versionId with &
+        origin_url = f"{ORIGIN_S3_URL}/{bucket}/{quote(base_key)}?{query_params}&versionId={version_id}"
+    else:
+        # No existing query params, add versionId with ?
+        origin_url = f"{ORIGIN_S3_URL}/{bucket}/{quote(base_key)}?versionId={version_id}"
+    
     new_response = await client.request(
          method, origin_url, headers=original_headers, auth=origin_aws_auth, content=body
     )
