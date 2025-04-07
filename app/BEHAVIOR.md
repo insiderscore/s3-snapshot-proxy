@@ -61,3 +61,13 @@ Compatible handling of DELETE requests
   which requires that a non-deleted version of the object must not
   already exist. 
 
+Handling of ListObjectsV2:
+
+- For a given combination of prefix and delimeter, the proxy will
+  enumerate all object versions and delete markers from the origin
+  bucket which should be visible as of START_TIME, plus any superseding
+  objects or delete markers from the overlay bucket.
+
+- A delete marker for a given key will render all previous versions for
+  that same key invisible. 
+

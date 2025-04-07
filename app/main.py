@@ -664,42 +664,58 @@ async def list_objects_handler(bucket: str, request: Request, prefix: str = ""):
         is_truncated = True
         key_marker = None
         version_id_marker = None
-
+        
+        # Initialize dictionaries to track objects and common prefixes
+        objects = {}  # key: object key, value: latest version before START_TIME
+        deleted_keys = set()  # Track keys that were deleted as of START_TIME
+        
         while is_truncated:
             logging.info("Fetching paginated result for ListObjectVersions params: %s", origin_params)
-            # origin_params = {"Bucket": bucket, "Prefix": prefix or ""}
             if key_marker:
                 origin_params["KeyMarker"] = key_marker
                 origin_params["VersionIdMarker"] = version_id_marker
                 
             origin_resp = s3_client_origin.list_object_versions(**origin_params)
             
-            # Process this batch of versions...
+            # Process versions from origin, keeping only the latest version before START_TIME for each key
+            if "Versions" in origin_resp:
+                for ver in origin_resp["Versions"]:
+                    key = ver["Key"]
+                    # Skip keys that were known to be deleted
+                    if key in deleted_keys:
+                        continue
+                    # Only consider versions from before START_TIME
+                    if ver["LastModified"] < START_TIME:
+                        # If we haven't seen this key before, or this version is newer than what we have
+                        if key not in objects or ver["LastModified"] > objects[key]["LastModified"]:
+                            objects[key] = {
+                                "Key": key,
+                                "LastModified": ver["LastModified"],
+                                "ETag": ver.get("ETag", ""),
+                                "Size": ver.get("Size", 0),
+                                "StorageClass": ver.get("StorageClass", "STANDARD")
+                            }
+            
+            # Process delete markers from origin
+            if "DeleteMarkers" in origin_resp:
+                for dm in origin_resp["DeleteMarkers"]:
+                    key = dm["Key"]
+                    # Only consider delete markers from before START_TIME
+                    if dm["LastModified"] < START_TIME:
+                        # If this delete marker is newer than any existing version we have for the key
+                        # or if we haven't seen this key before, mark it as deleted
+                        if key not in objects or dm["LastModified"] > objects[key]["LastModified"]:
+                            deleted_keys.add(key)
+                            if key in objects:
+                                del objects[key]
             
             # Update markers for next iteration
             is_truncated = origin_resp.get('IsTruncated', False)
             if is_truncated:
                 key_marker = origin_resp.get('NextKeyMarker')
                 version_id_marker = origin_resp.get('NextVersionIdMarker')
-        
-        # Initialize dictionaries to track objects and common prefixes
-        objects = {}  # key: object key, value: latest version before START_TIME
-        
-        # Process versions from origin, keeping only the latest version before START_TIME for each key
-        if "Versions" in origin_resp:
-            for ver in origin_resp["Versions"]:
-                key = ver["Key"]
-                # Only consider versions from before START_TIME
-                if ver["LastModified"] < START_TIME:
-                    # If we haven't seen this key before, or this version is newer than what we have
-                    if key not in objects or ver["LastModified"] > objects[key]["LastModified"]:
-                        objects[key] = {
-                            "Key": key,
-                            "LastModified": ver["LastModified"],
-                            "ETag": ver.get("ETag", ""),
-                            "Size": ver.get("Size", 0),
-                            "StorageClass": ver.get("StorageClass", "STANDARD")
-                        }
+            else:
+                break
         
         # Process common prefixes from origin
         origin_common_prefixes = []
