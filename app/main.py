@@ -972,62 +972,6 @@ async def handle_conditional_mutation(
     # Default: return the original 412 response
     return response
 
-async def handle_special_put_conditions(
-    method: str, full_path: str, original_headers: dict
-) -> Optional[Response]:
-    """
-    Handle special preconditions for PUT requests before sending to overlay.
-    Returns a Response object if the request should be rejected, None if it should proceed.
-    """
-    # Only handle PUT requests with If-None-Match: *
-    if method != "PUT" or original_headers.get("if-none-match") != "*":
-        return None
-        
-    parts = full_path.split('/', 1)
-    bucket = parts[0]
-    key = parts[1] if len(parts) > 1 else ""
-    overlay_path = f"{bucket}/{key}"
-    
-    # First check if object exists in overlay
-    try:
-        s3_client_overlay.head_object(Bucket=OVERLAY_BUCKET, Key=overlay_path)
-        # Object exists in overlay, return 412
-        logging.info(f"If-None-Match: * condition not satisfied - object exists in overlay: {overlay_path}")
-        return Response(
-            content=b"<Error><Code>PreconditionFailed</Code><Message>At least one of the pre-conditions you specified did not hold</Message></Error>",
-            status_code=412,
-            headers={"Content-Type": "application/xml"}
-        )
-    except botocore.exceptions.ClientError as e:
-        error_code = e.response.get("Error", {}).get("Code", "")
-        
-        # Handle 404 specifically - object doesn't exist in overlay
-        if error_code == "NoSuchKey" or error_code == "404":
-            # Now check origin at START_TIME
-            try:
-                origin_obj = check_object_at_start_time(bucket, key)
-                if origin_obj:
-                    # Object exists in origin at START_TIME, return 412
-                    logging.info(f"If-None-Match: * condition not satisfied - object exists in origin at START_TIME: {bucket}/{key}")
-                    return Response(
-                        content=b"<Error><Code>PreconditionFailed</Code><Message>At least one of the pre-conditions you specified did not hold</Message></Error>",
-                        status_code=412,
-                        headers={"Content-Type": "application/xml"}
-                    )
-            except Exception as ex:
-                logging.error(f"Error checking origin for If-None-Match: * condition: {ex}")
-                # Continue with regular request on error (safer than blocking)
-        else:
-            # For any other error from overlay check, pass through the error
-            logging.error(f"Error checking overlay for If-None-Match: * condition: {e}")
-            return Response(
-                content=str(e).encode("utf-8"),
-                status_code=e.response.get("ResponseMetadata", {}).get("HTTPStatusCode", 500),
-                headers={"Content-Type": "text/plain"}
-            )
-    
-    # All checks passed, proceed with regular request flow
-    return None
 
 async def handle_if_none_match_star_put(
     full_path: str, original_headers: dict
@@ -1088,23 +1032,24 @@ async def proxy(full_path: str, request: Request):
     original_headers = dict(request.headers)
     logging.info("Received %s request for %s", method, full_path)
     
-    # Handle PUT with If-None-Match header
+    # Special case: PUT with If-None-Match
     if method == "PUT" and "if-none-match" in {k.lower() for k in original_headers.keys()}:
         if_none_match = original_headers.get("if-none-match")
         
-        # Special case: If-None-Match: * is allowed
-        if if_none_match == "*":
-            special_response = await handle_if_none_match_star_put(full_path, original_headers)
-            if special_response:
-                return special_response
-        else:
-            # Any other If-None-Match value is not supported for PUT
+        # Only If-None-Match: * is allowed for PUT, return 501 for any other value
+        if if_none_match != "*":
             logging.info(f"Unsupported If-None-Match value for PUT: {if_none_match}")
             return Response(
                 content=b"<Error><Code>NotImplemented</Code><Message>The If-None-Match header is only supported with value * for PUT operations</Message></Error>",
                 status_code=501,
                 headers={"Content-Type": "application/xml"}
             )
+            
+        # Special handling for If-None-Match: *
+        # Pre-emptively check both overlay and origin before proceeding
+        special_response = await handle_if_none_match_star_put(full_path, original_headers)
+        if special_response:
+            return special_response
     
     # Use filtered headers for overlay S3 request.
     overlay_headers = {
