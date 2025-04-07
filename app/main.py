@@ -994,27 +994,73 @@ def check_object_at_start_time(bucket: str, key: str):
     """
     s3_client_origin = get_origin_s3_client()
     try:
-        # List versions to find the one that was current at START_TIME
-        versions_response = s3_client_origin.list_object_versions(Bucket=bucket, Prefix=key)
+        # Initialize variables for pagination
+        is_truncated = True
+        key_marker = None
+        version_id_marker = None
         
         # Find the most recent version that existed before START_TIME
         candidate = None
         candidate_time = None
-        if "Versions" in versions_response:
-            for ver in versions_response["Versions"]:
-                # Only consider exact key matches (prefix could return other keys)
-                if ver["Key"] != key:
-                    continue
-                    
-                # Only consider versions before START_TIME
-                if filter_version_by_start_time(ver, START_TIME):
-                    # Keep the version if it's the first one found or newer than what we have
-                    if candidate is None or ver["LastModified"] > candidate_time:
-                        candidate = ver
-                        candidate_time = ver["LastModified"]
+        latest_delete_marker = None
+        latest_delete_marker_time = None
         
-        # If no suitable version found, the object didn't exist at START_TIME
-        if candidate is None:
+        # Paginate through all versions
+        while is_truncated:
+            # Build parameters for this request
+            params = {
+                "Bucket": bucket,
+                "Prefix": key
+            }
+            
+            # Add pagination markers if we have them
+            if key_marker:
+                params["KeyMarker"] = key_marker
+                if version_id_marker:
+                    params["VersionIdMarker"] = version_id_marker
+            
+            # List versions for this page
+            versions_response = s3_client_origin.list_object_versions(**params)
+            
+            # Process regular versions
+            if "Versions" in versions_response:
+                for ver in versions_response["Versions"]:
+                    # Only consider exact key matches (prefix could return other keys)
+                    if ver["Key"] != key:
+                        continue
+                        
+                    # Only consider versions before START_TIME
+                    if filter_version_by_start_time(ver, START_TIME):
+                        # Keep the version if it's the first one found or newer than what we have
+                        if candidate is None or ver["LastModified"] > candidate_time:
+                            candidate = ver
+                            candidate_time = ver["LastModified"]
+            
+            # Process delete markers
+            if "DeleteMarkers" in versions_response:
+                for dm in versions_response["DeleteMarkers"]:
+                    # Only consider exact key matches
+                    if dm["Key"] != key:
+                        continue
+                    
+                    # Only consider delete markers before START_TIME
+                    if filter_version_by_start_time(dm, START_TIME):
+                        # Track the newest delete marker
+                        if latest_delete_marker is None or dm["LastModified"] > latest_delete_marker_time:
+                            latest_delete_marker = dm
+                            latest_delete_marker_time = dm["LastModified"]
+            
+            # Update pagination markers
+            is_truncated = versions_response.get('IsTruncated', False)
+            if is_truncated:
+                key_marker = versions_response.get('NextKeyMarker')
+                version_id_marker = versions_response.get('NextVersionIdMarker')
+            else:
+                break
+        
+        # If the most recent delete marker is newer than the most recent version,
+        # or if no suitable version found, the object should be considered non-existent at START_TIME
+        if candidate is None or (latest_delete_marker_time is not None and latest_delete_marker_time > candidate_time):
             return None
             
         # Get the specific version's complete metadata
