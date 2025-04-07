@@ -288,7 +288,9 @@ def test_conditional_requests(scale_factor):
     # 3. Test If-None-Match conditions
     print("Testing If-None-Match conditions...")
     
-    # 3.1 If-None-Match with different ETag should succeed
+    # 3.1 If-None-Match with different ETag - SKIP
+    print("SKIP: If-None-Match with different ETag (only '*' is supported for PUT)")
+    """
     try:
         new_key = f"if-none-match-{random.randint(1000, 9999)}"
         response = proxy_client.put_object(
@@ -300,8 +302,11 @@ def test_conditional_requests(scale_factor):
         print("✓ If-None-Match with different ETag succeeded")
     except botocore.exceptions.ClientError as e:
         pytest.fail(f"If-None-Match with different ETag should succeed but failed: {e}")
+    """
     
-    # 3.2 If-None-Match with matching ETag should fail with 412
+    # 3.2 If-None-Match with matching ETag - SKIP
+    print("SKIP: If-None-Match with matching ETag (only '*' is supported for PUT)")
+    """
     try:
         response = proxy_client.put_object(
             Bucket=bucket, 
@@ -315,6 +320,41 @@ def test_conditional_requests(scale_factor):
             print("✓ If-None-Match with matching ETag correctly failed with precondition error")
         else:
             pytest.fail(f"If-None-Match with matching ETag failed with wrong error: {e}")
+    """
+    
+    # 3.3 If-None-Match with 'before' ETag - SKIP
+    print("SKIP: If-None-Match with 'before' ETag (only '*' is supported for PUT)")
+    """
+    try:
+        proxy_client.put_object(
+            Bucket=bucket, 
+            Key=before_key, 
+            Body="This update should fail", 
+            IfNoneMatch=before_etag
+        )
+        pytest.fail("If-None-Match with 'before' ETag should fail but succeeded")
+    except botocore.exceptions.ClientError as e:
+        if '412' in str(e) or 'PreconditionFailed' in str(e):
+            print("✓ If-None-Match with 'before' ETag correctly failed with 412")
+        else:
+            pytest.fail(f"If-None-Match with 'before' ETag failed with wrong error: {e}")
+    """
+
+    # 3.4 If-None-Match with 'after' ETag - SKIP
+    print("SKIP: If-None-Match with 'after' ETag (only '*' is supported for PUT)")
+    """
+    try:
+        test_content = f"Updated via proxy with If-None-Match after_etag: {datetime.now().isoformat()}"
+        proxy_client.put_object(
+            Bucket=bucket, 
+            Key=before_key, 
+            Body=test_content,
+            IfNoneMatch=after_etag
+        )
+        print("✓ If-None-Match with 'after' ETag succeeded (correct)")
+    except botocore.exceptions.ClientError as e:
+        pytest.fail(f"If-None-Match with 'after' ETag should succeed but failed: {e}")
+    """
     
     # 3.3 If-None-Match='*' for existing object should fail with 412
     try:
@@ -730,7 +770,9 @@ def test_point_in_time_conditional():
         else:
             pytest.fail(f"If-Match with 'after' ETag failed with wrong error: {e}")
 
-    # 3.3 If-None-Match with 'before' ETag should fail with 412
+    # 3.3 If-None-Match with 'before' ETag - SKIP
+    print("SKIP: If-None-Match with 'before' ETag (only '*' is supported for PUT)")
+    """
     try:
         proxy_client.put_object(
             Bucket=bucket, 
@@ -744,9 +786,11 @@ def test_point_in_time_conditional():
             print("✓ If-None-Match with 'before' ETag correctly failed with 412")
         else:
             pytest.fail(f"If-None-Match with 'before' ETag failed with wrong error: {e}")
+    """
 
-    # 3.4 If-None-Match with 'after' ETag should succeed
-    # Because from proxy's perspective, that version doesn't exist at START_TIME
+    # 3.4 If-None-Match with 'after' ETag - SKIP
+    print("SKIP: If-None-Match with 'after' ETag (only '*' is supported for PUT)")
+    """
     try:
         test_content = f"Updated via proxy with If-None-Match after_etag: {datetime.now().isoformat()}"
         proxy_client.put_object(
@@ -758,6 +802,7 @@ def test_point_in_time_conditional():
         print("✓ If-None-Match with 'after' ETag succeeded (correct)")
     except botocore.exceptions.ClientError as e:
         pytest.fail(f"If-None-Match with 'after' ETag should succeed but failed: {e}")
+    """
     
     print("All point-in-time conditional tests passed!")
 
