@@ -57,9 +57,9 @@ Compatible handling of DELETE requests
   requests and instead return 501.
 
 - For standard versioned buckets on a real Amazon S3 endpoint, the only
-  If-None-Match value supported for conditional PUT requests is '*',
-  which requires that a non-deleted version of the object must not
-  already exist. 
+  If-None-Match value supported for conditional PUT requests is '*'. The
+  value '*' means there must be no already existing non-deleted version
+  with the same key.
 
 Handling of ListObjectsV2:
 
