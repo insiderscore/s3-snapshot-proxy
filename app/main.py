@@ -232,14 +232,21 @@ async def handle_precondition_failure(
     # Parse bucket and key from full_path
     parts = full_path.strip("/").split("/", 1)
     if len(parts) == 2:
-        bucket, key = parts
+        bucket, key = parts[0], parts[1]
     else:
         bucket, key = parts[0], ""
         
     # Parse out any existing query parameters
     key_parts = key.split("?", 1)
     base_key = key_parts[0]
-    query_params = key_parts[1] if len(key_parts) > 1 else ""
+    query_string = key_parts[1] if len(key_parts) > 1 else ""
+    
+    # Properly check if versionId parameter exists
+    from urllib.parse import parse_qsl
+    query_params = parse_qsl(query_string)
+    if any(k.lower() == "versionid" for k, v in query_params):
+        logging.info("Request already specifies a version ID. Respecting original 412 response.")
+        return response
 
     logging.info("Received 412. Checking object state at START_TIME for: %s, key: %s", bucket, base_key)
     
@@ -253,16 +260,19 @@ async def handle_precondition_failure(
     version_id = origin_obj.get("VersionId")
     logging.info("Found version %s. Retrying origin request with version subresource.", version_id)
     
-    # Properly reconstruct URL with query parameters
-    if query_params:
-        # If there are existing query params, add versionId with &
-        origin_url = f"{ORIGIN_S3_URL}/{bucket}/{quote(base_key)}?{query_params}&versionId={version_id}"
+    # Create the version parameter string
+    version_param = f"versionId={version_id}"
+    
+    # Construct URL with minimal changes
+    if query_string:
+        # Use & to append to existing query parameters
+        origin_url = f"{ORIGIN_S3_URL}/{bucket}/{quote(base_key)}?{query_string}&{version_param}"
     else:
-        # No existing query params, add versionId with ?
-        origin_url = f"{ORIGIN_S3_URL}/{bucket}/{quote(base_key)}?versionId={version_id}"
+        # No existing query params, use ?
+        origin_url = f"{ORIGIN_S3_URL}/{bucket}/{quote(base_key)}?{version_param}"
     
     new_response = await client.request(
-         method, origin_url, headers=original_headers, auth=origin_aws_auth, content=body
+        method, origin_url, headers=original_headers, auth=origin_aws_auth, content=body
     )
     return new_response
 
