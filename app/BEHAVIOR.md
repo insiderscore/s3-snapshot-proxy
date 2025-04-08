@@ -71,3 +71,14 @@ Handling of ListObjectsV2:
 - A delete marker for a given key will render all previous versions for
   that same key invisible. 
 
+- Due a shortcoming in the v2 S3 API as implemented by boto3, we must
+  rely on the lastModified timestamp to tell which versions should be
+  invisible as a result of a delete marker in the origin bucket. While
+  the REST endpoint returns a single chronically ordered list of
+  versions and delete markers, the API wrapper breaks them into two
+  separate lists. When recombining into a single ordered list, the
+  timestamp precision is insufficient to determine the order of
+  operations which collide on the same second. In this condition, we
+  return the first (newest) object from the collision. (FIXME: We can
+  avoid this problem by hitting the REST endpoint directly and parsing
+  the returned XML)
