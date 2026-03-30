@@ -8,8 +8,8 @@ RUN apt-get update && \
     rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+COPY requirements.lock pyproject.toml ./
+RUN pip install --no-cache-dir --require-hashes -r requirements.lock
 
 COPY app/ ./app
 ENV PYTHONUNBUFFERED=1
@@ -23,7 +23,7 @@ HEALTHCHECK --interval=5s --timeout=3s --retries=3 CMD test -f /tmp/buckets-read
 # Test target
 FROM base AS test
 WORKDIR /app
-COPY tests/requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+COPY requirements.lock .
+RUN pip install --no-cache-dir --require-hashes -r requirements.lock
 
 COPY tests/ ./tests
