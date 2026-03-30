@@ -1,3 +1,5 @@
+# DEPRECATED - use pyproject.toml and requirements.lock for python dependencies
+# pyproject.toml was created using this requirements.txt as a base
 annotated-doc==0.0.4
 annotated-types==0.7.0
 anyio==4.13.0
