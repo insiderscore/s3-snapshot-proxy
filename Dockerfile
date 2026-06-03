@@ -1,6 +1,5 @@
 FROM python:3.11-slim AS base
 
-
 # Install curl and other dependencies
 RUN apt-get update && \
     apt-get install -y curl && \
@@ -8,14 +7,20 @@ RUN apt-get update && \
     rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+COPY --from=ghcr.io/astral-sh/uv@sha256:3472e43b4e738cf911c99d41bb34331280efad54c73b1def654a6227bb59b2b4 /uv /uvx /bin/
+
+COPY pyproject.toml uv.lock ./
+# Makes it so we can use "python foo" instead of "uv run python foo"
+ENV UV_PROJECT_ENVIRONMENT="/usr/local"
+
+RUN uv sync --frozen --no-dev --no-install-project
+
 
 COPY app/ ./app
 ENV PYTHONUNBUFFERED=1
 CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "9000"]
 
-FROM minio/mc as minio-waiter
+FROM minio/mc AS minio-waiter
 COPY tests/wait-for-buckets.sh /app/tests/wait-for-buckets.sh
 ENTRYPOINT ["sh", "/app/tests/wait-for-buckets.sh"]
 HEALTHCHECK --interval=5s --timeout=3s --retries=3 CMD test -f /tmp/buckets-ready || exit 1
@@ -23,7 +28,5 @@ HEALTHCHECK --interval=5s --timeout=3s --retries=3 CMD test -f /tmp/buckets-read
 # Test target
 FROM base AS test
 WORKDIR /app
-COPY tests/requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
-
 COPY tests/ ./tests
+RUN uv sync --frozen --group test --no-dev --no-install-project
