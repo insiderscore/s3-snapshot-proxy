@@ -1,6 +1,14 @@
 version: "3.8"
 
 services:
+  uv-lock:
+    image: ghcr.io/astral-sh/uv:python3.11-bookworm
+    profiles: ["tools"]
+    working_dir: /app
+    volumes:
+      - .:/app
+    command: ["uv", "lock", "--python", "3.11"]
+
   s3proxy:
     build:
       context: .
