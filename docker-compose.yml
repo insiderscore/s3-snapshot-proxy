@@ -2,7 +2,7 @@ version: "3.8"
 
 services:
   uv-lock:
-    image: ghcr.io/astral-sh/uv:python3.11-bookworm
+    image: ghcr.io/astral-sh/uv:python3.11-bookworm@sha256:58683a39536f1f4ed2e1dd79cf155edccfb47731aba8964bd0312aac942126cf
     profiles: ["tools"]
     working_dir: /app
     volumes:
@@ -30,7 +30,7 @@ services:
       - "~/.aws:/root/.aws"
 
   minio-overlay:
-    image: minio/minio
+    image: minio/minio@sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e
     command: server /data --console-address ":9001"
     ports:
       - "9001:9001"
@@ -40,7 +40,7 @@ services:
       MINIO_SECRET_KEY: overlay-secret
 
   minio-init:
-    image: minio/mc
+    image: minio/mc@sha256:a7fe349ef4bd8521fb8497f55c6042871b2ae640607cf99d9bede5e9bdf11727
     depends_on:
       - minio-overlay
     entrypoint: >
