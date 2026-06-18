@@ -15,6 +15,9 @@ services:
       - AWS_SECRET_ACCESS_KEY=origin-secret
       - OVERLAY_AWS_ACCESS_KEY_ID=overlay-access
       - OVERLAY_AWS_SECRET_ACCESS_KEY=overlay-secret
+      - PYTHONDONTWRITEBYTECODE=1
+    volumes:
+      - ./app:/app/app:ro
     depends_on:
       origin-populator:
         condition: service_completed_successfully
@@ -96,6 +99,10 @@ services:
     environment:
       - PYTHONPATH=/app
       - SCALE_FACTOR=${SCALE_FACTOR:-100}
+      - PYTHONDONTWRITEBYTECODE=1
+    volumes:
+      - ./app:/app/app:ro
+      - ./tests:/app/tests:ro
     entrypoint: "python /app/tests/populate_origin.py"
 
   test-runner:
@@ -106,6 +113,12 @@ services:
       s3proxy:
         condition: service_healthy
     working_dir: /app/tests
+    environment:
+      - PYTHONDONTWRITEBYTECODE=1
+      - PYTEST_ADDOPTS=-p no:cacheprovider
+    volumes:
+      - ./app:/app/app:ro
+      - ./tests:/app/tests:ro
     entrypoint: "pytest test_regression.py --disable-warnings --capture=no --scale-factor=100"
 
   conformance-runner:
@@ -133,5 +146,9 @@ services:
       - CONFORMANCE_ARTIFACT_DIR=/app/tests/conformance/artifacts
       - CONFORMANCE_ADVISORY=${CONFORMANCE_ADVISORY:-true}
       - S3TESTS_ROOT=/opt/s3-tests
+      - PYTHONDONTWRITEBYTECODE=1
+      - PYTEST_ADDOPTS=-p no:cacheprovider
     volumes:
+      - ./app:/app/app:ro
+      - ./tests:/app/tests:ro
       - ./tests/conformance/artifacts:/app/tests/conformance/artifacts
