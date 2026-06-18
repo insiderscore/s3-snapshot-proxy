@@ -24,15 +24,12 @@ allowlist:
   decision before inclusion.
 - CopyObject and UploadPartCopy. These require source-object rewriting across
   the virtual bucket view.
-- Upstream multi-object delete tests that verify behavior through legacy
-  ListObjects. DeleteObjects itself is supported for the ListObjectsV2 and
-  ListObjectVersions surface.
 - Multi-object delete variants that depend on object-lock governance behavior
   or per-entry conditional fields such as ETag, LastModifiedTime, and Size.
-  Basic ListObjectsV2-visible batch deletes and overlay version-specific batch
-  deletes are supported. Version IDs that exist only in the origin bucket
-  return item-level failures because the proxy must never mutate origin bucket
-  versions.
+  Basic ListObjects/ListObjectsV2-visible batch deletes and overlay
+  version-specific batch deletes are supported. Version IDs that exist only in
+  the origin bucket return item-level failures because the proxy must never
+  mutate origin bucket versions.
 - Object tagging and bucket tagging.
 - Server-side encryption and customer-provided encryption keys.
 - S3 Select.
