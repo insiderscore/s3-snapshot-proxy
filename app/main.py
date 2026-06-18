@@ -767,6 +767,11 @@ def is_facilitator_version(s3_client, bucket, key, version):
         or response_has_facilitator_metadata(response.get("ResponseMetadata", {}).get("HTTPHeaders", {}))
     )
 
+def is_invalid_list_prefix_error(exc) -> bool:
+    if not isinstance(exc, botocore.exceptions.ClientError):
+        return False
+    return exc.response.get("Error", {}).get("Code") == "XMinioInvalidObjectName"
+
 def version_item_sort_key(item):
     last_modified = item.get("LastModified")
     timestamp = last_modified.timestamp() if isinstance(last_modified, datetime) else 0
@@ -835,7 +840,14 @@ class VersionItemStream:
                 request_params["VersionIdMarker"] = self.version_id_marker
 
         logging.info("Fetching ListObjectVersions params: %s", request_params)
-        response = self.s3_client.list_object_versions(**request_params)
+        try:
+            response = self.s3_client.list_object_versions(**request_params)
+        except botocore.exceptions.ClientError as exc:
+            if is_invalid_list_prefix_error(exc):
+                logging.info("Treating invalid ListObjectVersions prefix as empty: %s", request_params)
+                self.exhausted = True
+                return False
+            raise
         self.key_marker = response.get("NextKeyMarker")
         self.version_id_marker = response.get("NextVersionIdMarker")
         self.exhausted = not response.get("IsTruncated", False)
@@ -1063,7 +1075,14 @@ class VersionedKeyStream:
                 request_params["VersionIdMarker"] = self.version_id_marker
 
         logging.info("Fetching ListObjectVersions params: %s", request_params)
-        response = self.s3_client.list_object_versions(**request_params)
+        try:
+            response = self.s3_client.list_object_versions(**request_params)
+        except botocore.exceptions.ClientError as exc:
+            if is_invalid_list_prefix_error(exc):
+                logging.info("Treating invalid ListObjectVersions prefix as empty: %s", request_params)
+                self.exhausted = True
+                return False
+            raise
         self.key_marker = response.get("NextKeyMarker")
         self.version_id_marker = response.get("NextVersionIdMarker")
         self.exhausted = not response.get("IsTruncated", False)
@@ -1228,6 +1247,85 @@ def collect_list_objects_v2_page(bucket, prefix, delimiter, max_keys, marker):
             origin_state = next_stream_state(origin_stream)
         if consume_overlay:
             overlay_state = next_stream_state(overlay_stream)
+
+def parse_nonnegative_int(value: Optional[str], name: str, default: int):
+    if value is None:
+        return default, None
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return None, s3_error_response(
+            "InvalidArgument",
+            f"Argument {name} must be an integer",
+            400,
+        )
+    if parsed < 0:
+        return None, s3_error_response(
+            "InvalidArgument",
+            f"Argument {name} must be a non-negative integer",
+            400,
+        )
+    return parsed, None
+
+def validate_encoding_type(encoding_type: Optional[str]):
+    if encoding_type in {None, "url"}:
+        return None
+    return s3_error_response(
+        "InvalidArgument",
+        "Encoding type must be url",
+        400,
+    )
+
+def encode_list_text(value, encoding_type: Optional[str]) -> str:
+    text = "" if value is None else str(value)
+    if encoding_type == "url":
+        return quote(text, safe="/")
+    return text
+
+def append_list_contents_xml(root: ET.Element, obj: dict, encoding_type: Optional[str]):
+    cont_elem = ET.SubElement(root, "Contents")
+    ET.SubElement(cont_elem, "Key").text = encode_list_text(obj["Key"], encoding_type)
+    last_modified = obj.get("LastModified")
+    ET.SubElement(cont_elem, "LastModified").text = (
+        last_modified.isoformat() if isinstance(last_modified, datetime) else str(last_modified)
+    )
+    ET.SubElement(cont_elem, "ETag").text = obj.get("ETag", "")
+    ET.SubElement(cont_elem, "Size").text = str(obj.get("Size", 0))
+    ET.SubElement(cont_elem, "StorageClass").text = obj.get("StorageClass", "STANDARD")
+
+def append_common_prefix_xml(root: ET.Element, prefix: str, encoding_type: Optional[str]):
+    cp_elem = ET.SubElement(root, "CommonPrefixes")
+    ET.SubElement(cp_elem, "Prefix").text = encode_list_text(prefix, encoding_type)
+
+def process_list_objects_v1(bucket, prefix, delimiter, marker, max_keys, encoding_type):
+    entries, is_truncated, next_marker = collect_list_objects_v2_page(
+        bucket,
+        prefix,
+        delimiter,
+        max_keys,
+        marker,
+    )
+
+    root = ET.Element("ListBucketResult")
+    ET.SubElement(root, "Name").text = bucket
+    ET.SubElement(root, "Prefix").text = prefix
+    ET.SubElement(root, "Marker").text = marker or ""
+    ET.SubElement(root, "MaxKeys").text = str(max_keys)
+    if delimiter:
+        ET.SubElement(root, "Delimiter").text = delimiter
+    if encoding_type:
+        ET.SubElement(root, "EncodingType").text = encoding_type
+    ET.SubElement(root, "IsTruncated").text = "true" if is_truncated else "false"
+    if is_truncated:
+        ET.SubElement(root, "NextMarker").text = next_marker
+
+    for entry in entries:
+        if entry["Type"] == "CommonPrefix":
+            append_common_prefix_xml(root, entry["Prefix"], encoding_type)
+            continue
+        append_list_contents_xml(root, entry["Object"], encoding_type)
+
+    return ET.tostring(root, encoding="utf-8", method="xml")
 
 # Handle the versions logic
 def process_list_versions(bucket, prefix, delimiter, key_marker, version_id_marker, max_keys):
@@ -1425,12 +1523,17 @@ async def list_objects_handler(bucket: str, request: Request, prefix: str = ""):
     - If query parameter list-type=2 is present, process as ListObjectsV2.
     - If query parameter versions is present, process as ListObjectVersions.
     - If query parameter uploads is present, process as ListMultipartUploads.
-    - Otherwise, handle as a regular GET.
+    - Otherwise, process as legacy ListObjects.
     """
     params = request.query_params
     list_type = params.get("list-type")
     versions = params.get("versions")
     delimiter = params.get("delimiter")
+    encoding_type = params.get("encoding-type")
+
+    encoding_error = validate_encoding_type(encoding_type)
+    if encoding_error:
+        return encoding_error
 
     if query_has_param(request.url.query, "uploads"):
         list_uploads_prefix = params.get("prefix", prefix or "")
@@ -1450,7 +1553,9 @@ async def list_objects_handler(bucket: str, request: Request, prefix: str = ""):
     if list_type == "2":
         # ----- ListObjectsV2 logic -----
         prefix = params.get("prefix", prefix or "")
-        max_keys = int(params.get("max-keys", "1000"))
+        max_keys, max_keys_error = parse_nonnegative_int(params.get("max-keys"), "max-keys", 1000)
+        if max_keys_error:
+            return max_keys_error
         continuation_token = params.get("continuation-token")
         start_after = params.get("start-after")
         marker = continuation_token or start_after
@@ -1474,6 +1579,8 @@ async def list_objects_handler(bucket: str, request: Request, prefix: str = ""):
         if delimiter is not None:
             delimiter_elem = ET.SubElement(root, "Delimiter")
             delimiter_elem.text = delimiter
+        if encoding_type:
+            ET.SubElement(root, "EncodingType").text = encoding_type
         trunc_elem = ET.SubElement(root, "IsTruncated")
         trunc_elem.text = "true" if is_truncated else "false"
         
@@ -1491,30 +1598,19 @@ async def list_objects_handler(bucket: str, request: Request, prefix: str = ""):
         
         for entry in paginated:
             if entry["Type"] == "CommonPrefix":
-                cp_elem = ET.SubElement(root, "CommonPrefixes")
-                prefix_elem_cp = ET.SubElement(cp_elem, "Prefix")
-                prefix_elem_cp.text = entry["Prefix"]
+                append_common_prefix_xml(root, entry["Prefix"], encoding_type)
                 continue
 
-            obj = entry["Object"]
-            cont_elem = ET.SubElement(root, "Contents")
-            key_elem = ET.SubElement(cont_elem, "Key")
-            key_elem.text = obj["Key"]
-            lastmod_elem = ET.SubElement(cont_elem, "LastModified")
-            lastmod_elem.text = obj["LastModified"].isoformat() if isinstance(obj["LastModified"], datetime) else str(obj["LastModified"])
-            etag_elem = ET.SubElement(cont_elem, "ETag")
-            etag_elem.text = obj.get("ETag", "")
-            size_elem = ET.SubElement(cont_elem, "Size")
-            size_elem.text = str(obj.get("Size", 0))
-            storage_elem = ET.SubElement(cont_elem, "StorageClass")
-            storage_elem.text = obj.get("StorageClass", "STANDARD")
+            append_list_contents_xml(root, entry["Object"], encoding_type)
         
         xml_response = ET.tostring(root, encoding="utf-8", method="xml")
         return Response(content=xml_response, media_type="application/xml")
 
     elif versions is not None:
         # ----- ListObjectVersions logic (improved) -----
-        max_keys = int(params.get("max-keys", "1000"))
+        max_keys, max_keys_error = parse_nonnegative_int(params.get("max-keys"), "max-keys", 1000)
+        if max_keys_error:
+            return max_keys_error
         key_marker = params.get("key-marker")
         version_id_marker = params.get("version-id-marker")
         
@@ -1530,8 +1626,21 @@ async def list_objects_handler(bucket: str, request: Request, prefix: str = ""):
         return Response(content=xml_response, media_type="application/xml")
     
     else:
-        # Fallback: Regular GET on bucket.
-        return {"message": f"Regular GET for bucket: {bucket} with prefix: {prefix}"}
+        # ----- Legacy ListObjects logic -----
+        prefix = params.get("prefix", prefix or "")
+        marker = params.get("marker")
+        max_keys, max_keys_error = parse_nonnegative_int(params.get("max-keys"), "max-keys", 1000)
+        if max_keys_error:
+            return max_keys_error
+        xml_response = process_list_objects_v1(
+            bucket=bucket,
+            prefix=prefix,
+            delimiter=delimiter,
+            marker=marker,
+            max_keys=max_keys,
+            encoding_type=encoding_type,
+        )
+        return Response(content=xml_response, media_type="application/xml")
 
 async def handle_conditional_mutation(
     method: str,

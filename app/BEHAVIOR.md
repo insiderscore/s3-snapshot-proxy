@@ -73,12 +73,16 @@ Compatible handling of DELETE requests
   value '*' means there must be no already existing non-deleted version
   with the same key.
 
-Handling of ListObjectsV2:
+Handling of ListObjects and ListObjectsV2:
 
-- For a given combination of prefix and delimeter, the proxy will
+- For a given combination of prefix and delimiter, the proxy will
   enumerate all object versions and delete markers from the origin
   bucket which should be visible as of START_TIME, plus any superseding
   objects or delete markers from the overlay bucket.
+
+- Legacy ListObjects uses the same merged snapshot view as ListObjectsV2.
+  It accepts marker-based pagination and returns marker/NextMarker XML
+  fields rather than the v2 continuation-token fields.
 
 - A delete marker for a given key will render all previous versions for
   that same key invisible. 

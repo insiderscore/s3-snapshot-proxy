@@ -1,7 +1,10 @@
 import os
 import sys
+import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+
+import botocore.exceptions
 
 os.environ.setdefault("AWS_ACCESS_KEY_ID", "origin-access")
 os.environ.setdefault("AWS_SECRET_ACCESS_KEY", "origin-secret")
@@ -27,7 +30,10 @@ class FakeVersionClient:
         self.calls.append(dict(params))
         if len(self.calls) > len(self.pages):
             raise AssertionError(f"unexpected extra page fetch: {params}")
-        return self.pages[len(self.calls) - 1]
+        page = self.pages[len(self.calls) - 1]
+        if isinstance(page, Exception):
+            raise page
+        return page
 
     def head_object(self, **params):
         self.head_calls.append(dict(params))
@@ -73,6 +79,19 @@ def facilitator_head():
         },
         "ResponseMetadata": {"HTTPHeaders": {}},
     }
+
+
+def invalid_object_name_error():
+    return botocore.exceptions.ClientError(
+        {
+            "Error": {
+                "Code": "XMinioInvalidObjectName",
+                "Message": "Object name contains unsupported characters.",
+            },
+            "ResponseMetadata": {"HTTPStatusCode": 400},
+        },
+        "ListObjectVersions",
+    )
 
 
 def wire_clients(monkeypatch, origin_client, overlay_client):
@@ -211,6 +230,86 @@ def test_list_v2_delimiter_coalesces_common_prefixes(monkeypatch):
     ]
     assert is_truncated is False
     assert next_token == ""
+
+
+def test_list_v2_treats_invalid_overlay_prefix_as_empty(monkeypatch):
+    origin_client = FakeVersionClient([{"Versions": []}])
+    overlay_client = FakeVersionClient([invalid_object_name_error()])
+    wire_clients(monkeypatch, origin_client, overlay_client)
+
+    entries, is_truncated, next_token = main.collect_list_objects_v2_page(
+        "bucket", "/", None, 10, None
+    )
+
+    assert entries == []
+    assert is_truncated is False
+    assert next_token == ""
+    assert overlay_client.calls[0]["Prefix"] == "bucket//"
+
+
+def test_list_v1_renders_marker_and_next_marker(monkeypatch):
+    origin_client = FakeVersionClient([
+        {"Versions": [version("a", 1), version("b", 1)]}
+    ])
+    overlay_client = FakeVersionClient([{"IsTruncated": False}])
+    wire_clients(monkeypatch, origin_client, overlay_client)
+
+    xml_response = main.process_list_objects_v1("bucket", "", None, "", 1, None)
+    root = ET.fromstring(xml_response)
+
+    assert root.findtext("Marker") == ""
+    assert root.findtext("MaxKeys") == "1"
+    assert root.findtext("IsTruncated") == "true"
+    assert root.findtext("NextMarker") == "a"
+    assert [elem.findtext("Key") for elem in root.findall("Contents")] == ["a"]
+
+
+def test_list_v1_url_encodes_keys_and_common_prefixes(monkeypatch):
+    origin_client = FakeVersionClient([
+        {
+            "Versions": [
+                version("foo+1/bar", 1),
+                version("quux ab/thud", 1),
+                version("asdf+b", 1),
+            ]
+        }
+    ])
+    overlay_client = FakeVersionClient([{"IsTruncated": False}])
+    wire_clients(monkeypatch, origin_client, overlay_client)
+
+    xml_response = main.process_list_objects_v1("bucket", "", "/", None, 10, "url")
+    root = ET.fromstring(xml_response)
+
+    assert root.findtext("EncodingType") == "url"
+    assert [elem.findtext("Key") for elem in root.findall("Contents")] == ["asdf%2Bb"]
+    assert [
+        elem.findtext("Prefix") for elem in root.findall("CommonPrefixes")
+    ] == ["foo%2B1/", "quux%20ab/"]
+
+
+def test_list_v1_exact_key_ending_in_delimiter_is_content(monkeypatch):
+    origin_client = FakeVersionClient([{"Versions": []}])
+    overlay_client = FakeVersionClient([
+        {"Versions": [version("bucket/asdf/", 1)]}
+    ])
+    wire_clients(monkeypatch, origin_client, overlay_client)
+
+    xml_response = main.process_list_objects_v1("bucket", "asdf/", "/", None, 10, None)
+    root = ET.fromstring(xml_response)
+
+    assert [elem.findtext("Key") for elem in root.findall("Contents")] == ["asdf/"]
+    assert root.findall("CommonPrefixes") == []
+
+
+def test_list_v1_omits_empty_delimiter(monkeypatch):
+    origin_client = FakeVersionClient([{"Versions": [version("a", 1)]}])
+    overlay_client = FakeVersionClient([{"IsTruncated": False}])
+    wire_clients(monkeypatch, origin_client, overlay_client)
+
+    xml_response = main.process_list_objects_v1("bucket", "", "", None, 10, None)
+    root = ET.fromstring(xml_response)
+
+    assert root.find("Delimiter") is None
 
 
 def test_list_versions_small_page_uses_first_origin_page_only(monkeypatch):
