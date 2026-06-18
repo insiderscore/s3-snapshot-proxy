@@ -186,6 +186,30 @@ def rewrite_overlay_path(original_path: str) -> str:
         bucket, key = parts[0], ""
     return f"{OVERLAY_BUCKET}/{bucket}/{key}"
 
+def get_header(headers: dict, name: str) -> Optional[str]:
+    target = name.lower()
+    for key, value in headers.items():
+        if key.lower() == target:
+            return value
+    return None
+
+def precondition_failed_response() -> httpx.Response:
+    return httpx.Response(
+        status_code=412,
+        content=b"<Error><Code>PreconditionFailed</Code><Message>At least one of the pre-conditions you specified did not hold</Message></Error>",
+        headers={"Content-Type": "application/xml"},
+    )
+
+def should_forward_overlay_header(name: str) -> bool:
+    lower_name = name.lower()
+    if lower_name.startswith("authorization"):
+        return False
+    if lower_name.startswith("x-amz-meta-"):
+        return True
+    if lower_name.startswith("x-amz"):
+        return False
+    return True
+
 async def handle_delete_workaround(overlay_url: str, overlay_headers: dict, body: bytes) -> httpx.Response:
     """
     Handle DELETE requests using a facilitator object.
@@ -885,11 +909,17 @@ async def handle_conditional_mutation(
     """
     Handle conditional write (PUT) and delete (DELETE) requests that fail with 412 Precondition Failed.
     
-    If the overlay returns 412 and the key doesn't exist in overlay:
+    If the overlay returns 412 or a conditional PUT misses the overlay object:
     1. Check if the condition would be satisfied against the origin object as of START_TIME
     2. If so, retry the request against overlay with modified conditions
     """
-    if response.status_code != 412 or method not in {"PUT", "DELETE"}:
+    if method not in {"PUT", "DELETE"}:
+        return response
+
+    if_match = get_header(original_headers, "if-match")
+    if_none_match = get_header(original_headers, "if-none-match")
+    conditional_overlay_miss = method == "PUT" and response.status_code in {400, 404} and if_match
+    if response.status_code != 412 and not conditional_overlay_miss:
         return response
         
     # Parse bucket and key from full_path
@@ -913,42 +943,16 @@ async def handle_conditional_mutation(
         # Object doesn't exist in overlay, check origin
         pass
     
-    # Check original request conditions against origin
-    s3_client_origin = get_origin_s3_client()
     try:
-        # We need to find the version of the object that was current at START_TIME,
-        # not just the current version
-        versions_response = s3_client_origin.list_object_versions(Bucket=bucket, Prefix=key)
-        
-        # Find the most recent version that existed before START_TIME
-        candidate = None
-        candidate_time = None
-        if "Versions" in versions_response:
-            for ver in versions_response["Versions"]:
-                # Filter versions by START_TIME using our utility function
-                if filter_version_by_start_time(ver, START_TIME):
-                    if candidate is None or ver["LastModified"] > candidate_time:
-                        candidate = ver
-                        candidate_time = ver["LastModified"]
-        
-        # If no suitable version found, the object didn't exist at START_TIME
-        if candidate is None:
+        origin_obj = check_object_at_start_time(bucket, key)
+
+        if origin_obj is None:
             logging.info("No version of object existed at START_TIME, original 412 response is correct")
+            if response.status_code != 412 and if_match and if_match.strip() != "*":
+                return precondition_failed_response()
             return response
-            
-        # Get the specific version's complete metadata for condition checking
-        version_id = candidate["VersionId"]
-        origin_obj = s3_client_origin.head_object(
-            Bucket=bucket, 
-            Key=key, 
-            VersionId=version_id
-        )
         
         # Now check conditions against this point-in-time correct version
-        # Extract relevant conditions from original headers
-        if_match = original_headers.get("if-match")
-        if_none_match = original_headers.get("if-none-match")
-        
         # Check if the origin object satisfies these conditions
         satisfied = True
         
@@ -990,10 +994,15 @@ async def handle_conditional_mutation(
             
             logging.info("Conditional retry status: %s", new_response.status_code)
             return new_response
+
+        if response.status_code != 412:
+            return precondition_failed_response()
         
     except Exception as e:
         # Object doesn't exist in origin or other error
         logging.info("Error checking origin object: %s", str(e))
+        if response.status_code != 412 and if_match and if_match.strip() != "*":
+            return precondition_failed_response()
     
     # Default: return the original 412 response
     return response
@@ -1148,11 +1157,12 @@ async def handle_if_none_match_star_put(
 async def proxy(full_path: str, request: Request):
     method = request.method
     original_headers = dict(request.headers)
+    body = await request.body()
     logging.info("Received %s request for %s", method, full_path)
     
     # Special case: PUT with If-None-Match
     if method == "PUT" and "if-none-match" in {k.lower() for k in original_headers.keys()}:
-        if_none_match = original_headers.get("if-none-match")
+        if_none_match = get_header(original_headers, "if-none-match")
         
         # Only If-None-Match: * is allowed for PUT, return 501 for any other value
         if if_none_match != "*":
@@ -1172,9 +1182,8 @@ async def proxy(full_path: str, request: Request):
     # Use filtered headers for overlay S3 request.
     overlay_headers = {
         k: v for k, v in original_headers.items() 
-        if not k.lower().startswith("authorization") and not k.lower().startswith("x-amz")
+        if should_forward_overlay_header(k)
     }
-    body = await request.body()
     overlay_path = rewrite_overlay_path(full_path)
     overlay_url = f"{OVERLAY_S3_URL}/{quote(overlay_path)}"
     
@@ -1191,9 +1200,7 @@ async def proxy(full_path: str, request: Request):
         logging.info("Overlay response includes facilitator header; treating as delete marker (404)")
         response = httpx.Response(status_code=404, content=b"", headers=response.headers)
     
-    # Handle conditional mutation failures (412 Precondition Failed)
-    if response.status_code == 412 and method in {"PUT", "DELETE"}:
-        response = await handle_conditional_mutation(method, full_path, original_headers, body, response)
+    response = await handle_conditional_mutation(method, full_path, original_headers, body, response)
     
     # Fallback to origin S3 for GET/HEAD if needed
     if method in {"GET", "HEAD"}:

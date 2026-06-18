@@ -61,6 +61,47 @@ def populate_overlay_via_proxy(proxy_client, bucket_names, origin_keys, num_new,
     
     return new_keys, overlaid_keys, deleted_keys
 
+def find_pre_start_origin_object(origin_client, proxy_client, overlay_client, bucket, start_time, overlay_bucket):
+    candidates = {}
+    paginator = origin_client.get_paginator("list_object_versions")
+
+    for page in paginator.paginate(Bucket=bucket):
+        for version in page.get("Versions", []):
+            if version["LastModified"] < start_time:
+                candidates.setdefault(version["Key"], []).append({
+                    "ETag": version["ETag"],
+                    "Key": version["Key"],
+                    "LastModified": version["LastModified"],
+                    "VersionId": version["VersionId"],
+                })
+
+    sorted_keys = sorted(candidates, key=lambda key: len(candidates[key]), reverse=True)
+    for key in sorted_keys:
+        versions = sorted(candidates[key], key=lambda version: version["LastModified"], reverse=True)
+        newest_version = versions[0]
+        overlay_path = f"{bucket}/{key}"
+
+        try:
+            overlay_client.head_object(Bucket=overlay_bucket, Key=overlay_path)
+            continue
+        except botocore.exceptions.ClientError as e:
+            status_code = e.response.get("ResponseMetadata", {}).get("HTTPStatusCode")
+            error_code = e.response.get("Error", {}).get("Code")
+            if status_code != 404 and error_code not in {"404", "NoSuchKey", "NotFound"}:
+                raise
+
+        try:
+            proxy_client.head_object(Bucket=bucket, Key=key)
+        except botocore.exceptions.ClientError as e:
+            status_code = e.response.get("ResponseMetadata", {}).get("HTTPStatusCode")
+            if status_code == 404:
+                continue
+            raise
+
+        return key, newest_version["ETag"], newest_version["LastModified"]
+
+    pytest.fail(f"Could not find a pre-start origin object visible through proxy for bucket {bucket}")
+
 # Test the proxy
 def test_proxy(scale_factor):
     # Get the proxy's START_TIME from the health endpoint
@@ -205,22 +246,32 @@ def test_conditional_requests(scale_factor):
         aws_access_key_id="origin-access",
         aws_secret_access_key="origin-secret"
     )
+
+    health_data = requests.get("http://s3proxy:9000/health").json()
+    start_time = datetime.fromisoformat(health_data["startTime"])
+    overlay_bucket = health_data.get("overlayBucket", "overlay")
+    overlay_client = boto3.client(
+        "s3",
+        endpoint_url=health_data.get("overlayS3", "http://minio-overlay:9000"),
+        aws_access_key_id="overlay-access",
+        aws_secret_access_key="overlay-secret"
+    )
     
     bucket = "origin-bucket1"  # Use the first bucket for conditional tests
     
     # 1. Set up test objects
     print("Setting up test objects for conditional requests...")
     
-    # Create an object directly in origin
-    origin_key = f"origin-conditional-{random.randint(1000, 9999)}"
-    origin_content = f"Origin conditional test content {random.randint(1, 1000)}"
-    origin_client.put_object(Bucket=bucket, Key=origin_key, Body=origin_content)
-    
-    # Get its ETag and LastModified
-    origin_meta = origin_client.head_object(Bucket=bucket, Key=origin_key)
-    origin_etag = origin_meta['ETag']
-    origin_last_modified = origin_meta['LastModified']
-    print(f"Created origin object {bucket}/{origin_key} with ETag {origin_etag}")
+    origin_key, origin_etag, origin_last_modified = find_pre_start_origin_object(
+        origin_client,
+        proxy_client,
+        overlay_client,
+        bucket,
+        start_time,
+        overlay_bucket
+    )
+    print(f"Using pre-start origin object {bucket}/{origin_key} with ETag {origin_etag}")
+    print(f"Origin object LastModified: {origin_last_modified}")
     
     # Create an object via proxy
     proxy_key = f"proxy-conditional-{random.randint(1000, 9999)}"
