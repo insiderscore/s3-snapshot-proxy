@@ -2,8 +2,7 @@
 #
 # Keep this list focused on object APIs the proxy is plausibly expected to
 # support. Bucket lifecycle, IAM/STS, ACL/policy, multipart copy, copy,
-# tagging, encryption, S3 Select, and multi-object delete are tracked in
-# unsupported.md.
+# tagging, encryption, and S3 Select are tracked in unsupported.md.
 
 s3tests/functional/test_s3.py::test_object_head_zero_bytes
 s3tests/functional/test_s3.py::test_object_write_check_etag
@@ -43,11 +42,16 @@ s3tests/functional/test_s3.py::test_bucket_listv2_maxkeys_one
 s3tests/functional/test_s3.py::test_bucket_listv2_maxkeys_zero
 s3tests/functional/test_s3.py::test_bucket_listv2_maxkeys_none
 s3tests/functional/test_s3.py::test_bucket_listv2_continuationtoken
+s3tests/functional/test_s3.py::test_multi_objectv2_delete
+s3tests/functional/test_s3.py::test_multi_objectv2_delete_key_limit
 
 s3tests/functional/test_s3.py::test_versioning_obj_list_marker
 s3tests/functional/test_s3.py::test_versioning_stack_delete_merkers
 s3tests/functional/test_s3.py::test_versioning_obj_create_versions_remove_all
 s3tests/functional/test_s3.py::test_versioning_obj_create_versions_remove_special_names
+s3tests/functional/test_s3.py::test_versioning_multi_object_delete
+s3tests/functional/test_s3.py::test_versioning_multi_object_delete_with_marker
+s3tests/functional/test_s3.py::test_versioning_multi_object_delete_with_marker_create
 
 s3tests/functional/test_s3.py::test_multipart_upload_complete_without_create
 s3tests/functional/test_s3.py::test_multipart_upload_contents
