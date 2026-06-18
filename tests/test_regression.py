@@ -1472,6 +1472,157 @@ def test_list_objects_v2_with_delete_markers():
     
     print("ListObjectsV2 delete marker visibility test passed!")
 
+def test_multi_object_delete_via_proxy():
+    print("\n=== Testing Multi-Object Delete ===\n")
+
+    health_data = requests.get("http://s3proxy:9000/health").json()
+    start_time = datetime.fromisoformat(health_data["startTime"])
+    overlay_bucket = health_data.get("overlayBucket", "overlay")
+
+    origin_client = boto3.client(
+        "s3",
+        endpoint_url="http://minio-origin:9000",
+        aws_access_key_id="origin-access",
+        aws_secret_access_key="origin-secret"
+    )
+    overlay_client = boto3.client(
+        "s3",
+        endpoint_url=health_data.get("overlayS3", "http://minio-overlay:9000"),
+        aws_access_key_id="overlay-access",
+        aws_secret_access_key="overlay-secret"
+    )
+    proxy_client = boto3.client(
+        "s3",
+        endpoint_url="http://s3proxy:9000",
+        aws_access_key_id="origin-access",
+        aws_secret_access_key="origin-secret"
+    )
+
+    bucket = "origin-bucket1"
+    origin_key, _, _ = find_pre_start_origin_object(
+        origin_client,
+        proxy_client,
+        overlay_client,
+        bucket,
+        start_time,
+        overlay_bucket,
+    )
+    overlay_key = f"multi-delete/overlay-{random.randint(1000, 9999)}"
+    missing_key = f"multi-delete/missing-{random.randint(1000, 9999)}"
+
+    proxy_client.put_object(Bucket=bucket, Key=overlay_key, Body=b"overlay batch delete")
+
+    objects = [
+        {"Key": origin_key},
+        {"Key": overlay_key},
+        {"Key": missing_key},
+    ]
+    response = proxy_client.delete_objects(Bucket=bucket, Delete={"Objects": objects})
+    assert {item["Key"] for item in response.get("Deleted", [])} == {item["Key"] for item in objects}
+    assert "Errors" not in response
+
+    second_response = proxy_client.delete_objects(Bucket=bucket, Delete={"Objects": objects})
+    assert {item["Key"] for item in second_response.get("Deleted", [])} == {item["Key"] for item in objects}
+    assert "Errors" not in second_response
+
+    for key in (origin_key, overlay_key, missing_key):
+        with pytest.raises(botocore.exceptions.ClientError) as head_error:
+            proxy_client.head_object(Bucket=bucket, Key=key)
+        assert head_error.value.response.get("ResponseMetadata", {}).get("HTTPStatusCode") == 404
+
+        overlay_versions = overlay_client.list_object_versions(
+            Bucket=overlay_bucket,
+            Prefix=f"{bucket}/{key}",
+        )
+        delete_markers = [
+            item for item in overlay_versions.get("DeleteMarkers", [])
+            if item["Key"] == f"{bucket}/{key}"
+        ]
+        assert delete_markers, f"Expected overlay delete marker for {key}"
+
+def test_multi_object_delete_version_scope():
+    print("\n=== Testing Versioned Multi-Object Delete Scope ===\n")
+
+    health_data = requests.get("http://s3proxy:9000/health").json()
+    overlay_bucket = health_data.get("overlayBucket", "overlay")
+
+    origin_client = boto3.client(
+        "s3",
+        endpoint_url="http://minio-origin:9000",
+        aws_access_key_id="origin-access",
+        aws_secret_access_key="origin-secret"
+    )
+    overlay_client = boto3.client(
+        "s3",
+        endpoint_url=health_data.get("overlayS3", "http://minio-overlay:9000"),
+        aws_access_key_id="overlay-access",
+        aws_secret_access_key="overlay-secret"
+    )
+    proxy_client = boto3.client(
+        "s3",
+        endpoint_url="http://s3proxy:9000",
+        aws_access_key_id="origin-access",
+        aws_secret_access_key="origin-secret"
+    )
+
+    bucket = "origin-bucket1"
+    overlay_key = f"multi-delete-version/overlay-{random.randint(1000, 9999)}"
+    origin_key = f"multi-delete-version/origin-{random.randint(1000, 9999)}"
+
+    overlay_put = proxy_client.put_object(
+        Bucket=bucket,
+        Key=overlay_key,
+        Body=b"overlay version",
+    )
+    overlay_version_id = overlay_put["VersionId"]
+
+    origin_put = origin_client.put_object(
+        Bucket=bucket,
+        Key=origin_key,
+        Body=b"origin-only version",
+    )
+    origin_version_id = origin_put["VersionId"]
+
+    objects = [
+        {"Key": overlay_key, "VersionId": overlay_version_id},
+        {"Key": origin_key, "VersionId": origin_version_id},
+    ]
+    response = proxy_client.delete_objects(Bucket=bucket, Delete={"Objects": objects})
+
+    deleted = {(item["Key"], item.get("VersionId")) for item in response.get("Deleted", [])}
+    assert (overlay_key, overlay_version_id) in deleted
+
+    errors = response.get("Errors", [])
+    assert len(errors) == 1
+    assert errors[0]["Key"] == origin_key
+    assert errors[0]["VersionId"] == origin_version_id
+    assert errors[0]["Code"] == "AccessDenied"
+
+    overlay_versions = overlay_client.list_object_versions(
+        Bucket=overlay_bucket,
+        Prefix=f"{bucket}/{overlay_key}",
+    )
+    assert all(
+        item["VersionId"] != overlay_version_id
+        for item in overlay_versions.get("Versions", [])
+        if item["Key"] == f"{bucket}/{overlay_key}"
+    )
+
+    origin_head = origin_client.head_object(
+        Bucket=bucket,
+        Key=origin_key,
+        VersionId=origin_version_id,
+    )
+    assert origin_head["ContentLength"] == len(b"origin-only version")
+
+    retry_response = proxy_client.delete_objects(Bucket=bucket, Delete={"Objects": objects})
+    retry_deleted = {
+        (item["Key"], item.get("VersionId"))
+        for item in retry_response.get("Deleted", [])
+    }
+    assert (overlay_key, overlay_version_id) in retry_deleted
+    assert retry_response.get("Errors", [])[0]["Key"] == origin_key
+
 def test_multipart_upload_via_proxy():
     print("\n=== Testing Multipart Uploads ===\n")
 

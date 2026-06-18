@@ -234,6 +234,16 @@ def not_implemented_response(message: str) -> Response:
         headers={"Content-Type": "application/xml"},
     )
 
+def s3_error_response(code: str, message: str, status_code: int) -> Response:
+    root = ET.Element("Error")
+    ET.SubElement(root, "Code").text = code
+    ET.SubElement(root, "Message").text = message
+    return Response(
+        content=ET.tostring(root, encoding="utf-8", method="xml"),
+        status_code=status_code,
+        headers={"Content-Type": "application/xml"},
+    )
+
 def should_forward_overlay_header(name: str) -> bool:
     lower_name = name.lower()
     if lower_name.startswith("authorization"):
@@ -327,6 +337,232 @@ async def handle_delete_request(overlay_url: str, overlay_headers: dict, body: b
     response = await signed_client.request("DELETE", overlay_url, headers=overlay_headers, content=body)
     logging.info("Delete response status: %s, headers: %s", response.status_code, dict(response.headers))
     return response
+
+def xml_local_name(tag: str) -> str:
+    return tag.rsplit("}", 1)[-1]
+
+def child_text(parent: ET.Element, name: str) -> Optional[str]:
+    for child in parent:
+        if xml_local_name(child.tag) == name:
+            return child.text or ""
+    return None
+
+def parse_delete_objects_request(body: bytes):
+    try:
+        root = ET.fromstring(body)
+    except ET.ParseError:
+        return None, s3_error_response(
+            "MalformedXML",
+            "The XML you provided was not well-formed or did not validate against our published schema",
+            400,
+        )
+
+    if xml_local_name(root.tag) != "Delete":
+        return None, s3_error_response(
+            "MalformedXML",
+            "The XML you provided was not well-formed or did not validate against our published schema",
+            400,
+        )
+
+    quiet = (child_text(root, "Quiet") or "").strip().lower() == "true"
+    objects = []
+    for elem in root:
+        if xml_local_name(elem.tag) != "Object":
+            continue
+
+        key = child_text(elem, "Key")
+        if key is None:
+            return None, s3_error_response(
+                "MalformedXML",
+                "The XML you provided was not well-formed or did not validate against our published schema",
+                400,
+            )
+
+        version_id = child_text(elem, "VersionId")
+        conditions = [
+            xml_local_name(child.tag)
+            for child in elem
+            if xml_local_name(child.tag) in {"ETag", "LastModifiedTime", "Size"}
+        ]
+        objects.append({
+            "Key": key,
+            "VersionId": version_id if version_id else None,
+            "Conditions": conditions,
+        })
+
+    if not objects or len(objects) > 1000:
+        return None, s3_error_response(
+            "MalformedXML",
+            "The XML you provided was not well-formed or did not validate against our published schema",
+            400,
+        )
+
+    return {"Quiet": quiet, "Objects": objects}, None
+
+def append_delete_item_xml(root: ET.Element, tag: str, item: dict):
+    elem = ET.SubElement(root, tag)
+    ET.SubElement(elem, "Key").text = item.get("Key", "")
+    if item.get("VersionId"):
+        ET.SubElement(elem, "VersionId").text = item["VersionId"]
+    if "DeleteMarker" in item:
+        ET.SubElement(elem, "DeleteMarker").text = "true" if item["DeleteMarker"] else "false"
+    if item.get("DeleteMarkerVersionId"):
+        ET.SubElement(elem, "DeleteMarkerVersionId").text = item["DeleteMarkerVersionId"]
+    if tag == "Error":
+        ET.SubElement(elem, "Code").text = item.get("Code", "InternalError")
+        ET.SubElement(elem, "Message").text = item.get("Message", "")
+
+def delete_objects_result_xml(deleted: list[dict], errors: list[dict], quiet: bool) -> bytes:
+    root = ET.Element("DeleteResult")
+    if not quiet:
+        for item in deleted:
+            append_delete_item_xml(root, "Deleted", item)
+    for item in errors:
+        append_delete_item_xml(root, "Error", item)
+    return ET.tostring(root, encoding="utf-8", method="xml")
+
+def rewrite_delete_result_item(item: dict, bucket: str) -> dict:
+    result = dict(item)
+    hidden_prefix = f"{bucket}/"
+    key = result.get("Key", "")
+    if key.startswith(hidden_prefix):
+        result["Key"] = key[len(hidden_prefix):]
+    return result
+
+def version_exists(client, bucket: str, key: str, version_id: str) -> bool:
+    marker = {}
+    while True:
+        params = {"Bucket": bucket, "Prefix": key}
+        params.update(marker)
+        response = client.list_object_versions(**params)
+
+        for group in ("Versions", "DeleteMarkers"):
+            for item in response.get(group, []):
+                if item.get("Key") == key and item.get("VersionId") == version_id:
+                    return True
+
+        if not response.get("IsTruncated"):
+            return False
+
+        marker = {"KeyMarker": response.get("NextKeyMarker")}
+        if response.get("NextVersionIdMarker"):
+            marker["VersionIdMarker"] = response["NextVersionIdMarker"]
+
+def delete_objects_item_error(item: dict, code: str, message: str) -> dict:
+    error = {
+        "Key": item["Key"],
+        "Code": code,
+        "Message": message,
+    }
+    if item.get("VersionId"):
+        error["VersionId"] = item["VersionId"]
+    return error
+
+def create_delete_marker_facilitator(s3_client_overlay, overlay_key: str):
+    s3_client_overlay.put_object(
+        Bucket=OVERLAY_BUCKET,
+        Key=overlay_key,
+        Body=DELETE_MARKER_FACILITATOR_BODY,
+        Metadata={DELETE_MARKER_FACILITATOR_METADATA: "true"},
+    )
+
+async def handle_multi_object_delete_request(full_path: str, body: bytes) -> Response:
+    bucket, key = split_bucket_key(full_path)
+    if key:
+        return s3_error_response(
+            "MalformedXML",
+            "The XML you provided was not well-formed or did not validate against our published schema",
+            400,
+        )
+
+    parsed, error_response = parse_delete_objects_request(body)
+    if error_response:
+        return error_response
+
+    s3_client_overlay = get_overlay_s3_client()
+    s3_client_origin = get_origin_s3_client()
+    errors = []
+    overlay_delete_objects = []
+
+    for item in parsed["Objects"]:
+        overlay_key = f"{bucket}/{item['Key']}"
+
+        if item["Conditions"]:
+            errors.append(delete_objects_item_error(
+                item,
+                "NotImplemented",
+                "Conditional multi-object delete entries are not implemented",
+            ))
+            continue
+
+        version_id = item.get("VersionId")
+        if version_id:
+            try:
+                if version_exists(s3_client_overlay, OVERLAY_BUCKET, overlay_key, version_id):
+                    overlay_delete_objects.append({"Key": overlay_key, "VersionId": version_id})
+                    continue
+                if version_exists(s3_client_origin, bucket, item["Key"], version_id):
+                    errors.append(delete_objects_item_error(
+                        item,
+                        "AccessDenied",
+                        "Cannot delete versions that exist only in the origin bucket",
+                    ))
+                    continue
+            except botocore.exceptions.ClientError as exc:
+                response_error = exc.response.get("Error", {})
+                errors.append(delete_objects_item_error(
+                    item,
+                    response_error.get("Code", "InternalError"),
+                    response_error.get("Message", str(exc)),
+                ))
+                continue
+
+            overlay_delete_objects.append({"Key": overlay_key, "VersionId": version_id})
+            continue
+
+        try:
+            create_delete_marker_facilitator(s3_client_overlay, overlay_key)
+        except botocore.exceptions.ClientError as exc:
+            response_error = exc.response.get("Error", {})
+            errors.append(delete_objects_item_error(
+                item,
+                response_error.get("Code", "InternalError"),
+                response_error.get("Message", str(exc)),
+            ))
+            continue
+
+        overlay_delete_objects.append({"Key": overlay_key})
+
+    deleted = []
+    if overlay_delete_objects:
+        try:
+            response = s3_client_overlay.delete_objects(
+                Bucket=OVERLAY_BUCKET,
+                Delete={"Objects": overlay_delete_objects, "Quiet": False},
+            )
+        except botocore.exceptions.ClientError as exc:
+            response_error = exc.response.get("Error", {})
+            for object_ref in overlay_delete_objects:
+                virtual_item = rewrite_delete_result_item(object_ref, bucket)
+                errors.append(delete_objects_item_error(
+                    virtual_item,
+                    response_error.get("Code", "InternalError"),
+                    response_error.get("Message", str(exc)),
+                ))
+        else:
+            deleted.extend(
+                rewrite_delete_result_item(item, bucket)
+                for item in response.get("Deleted", [])
+            )
+            errors.extend(
+                rewrite_delete_result_item(item, bucket)
+                for item in response.get("Errors", [])
+            )
+
+    return Response(
+        content=delete_objects_result_xml(deleted, errors, parsed["Quiet"]),
+        media_type="application/xml",
+    )
 
 async def handle_precondition_failure(
     method: str,
@@ -1567,6 +1803,9 @@ async def proxy(full_path: str, request: Request):
     body = await request.body()
     multipart_subresource = is_multipart_upload_subresource(query_string)
     logging.info("Received %s request for %s", method, full_path)
+
+    if method == "POST" and query_has_param(query_string, "delete"):
+        return await handle_multi_object_delete_request(full_path, body)
 
     if has_header(original_headers, "x-amz-copy-source"):
         return not_implemented_response("CopyObject and UploadPartCopy are not implemented")

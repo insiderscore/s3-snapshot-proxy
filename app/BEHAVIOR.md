@@ -56,6 +56,18 @@ Compatible handling of DELETE requests
   are silently ignored. Our proxy should not forward conditional DELETE
   requests and instead return 501.
 
+- Multi-object delete is supported for ordinary object keys by applying the
+  same overlay delete-marker compatibility behavior to each unversioned item
+  in the request. The proxy rewrites virtual keys into the shared overlay
+  bucket, deletes there, and rewrites the returned keys back to the virtual
+  bucket view.
+
+- Version-specific multi-object delete entries are only allowed to mutate
+  versions in the overlay bucket. If the requested version ID exists only in
+  the origin bucket, the proxy returns an item-level AccessDenied error and
+  does not mutate the origin. Conditional multi-object delete fields such as
+  ETag, LastModifiedTime, and Size are not currently implemented.
+
 - For standard versioned buckets on a real Amazon S3 endpoint, the only
   If-None-Match value supported for conditional PUT requests is '*'. The
   value '*' means there must be no already existing non-deleted version
