@@ -1472,6 +1472,142 @@ def test_list_objects_v2_with_delete_markers():
     
     print("ListObjectsV2 delete marker visibility test passed!")
 
+def test_multipart_upload_via_proxy():
+    print("\n=== Testing Multipart Uploads ===\n")
+
+    health_data = requests.get("http://s3proxy:9000/health").json()
+    overlay_bucket = health_data.get("overlayBucket", "overlay")
+
+    origin_client = boto3.client(
+        "s3",
+        endpoint_url="http://minio-origin:9000",
+        aws_access_key_id="origin-access",
+        aws_secret_access_key="origin-secret"
+    )
+    overlay_client = boto3.client(
+        "s3",
+        endpoint_url=health_data.get("overlayS3", "http://minio-overlay:9000"),
+        aws_access_key_id="overlay-access",
+        aws_secret_access_key="overlay-secret"
+    )
+    proxy_client = boto3.client(
+        "s3",
+        endpoint_url="http://s3proxy:9000",
+        aws_access_key_id="origin-access",
+        aws_secret_access_key="origin-secret"
+    )
+
+    bucket = "origin-bucket1"
+    key = f"multipart/basic-{random.randint(1000, 9999)}"
+    body = (b"multipart upload through proxy\n" * 128)
+    upload_id = None
+    completed = False
+
+    try:
+        initiated = proxy_client.create_multipart_upload(
+            Bucket=bucket,
+            Key=key,
+            Metadata={"source": "regression"},
+        )
+        upload_id = initiated["UploadId"]
+        assert initiated["Bucket"] == bucket
+        assert initiated["Key"] == key
+
+        uploaded = proxy_client.upload_part(
+            Bucket=bucket,
+            Key=key,
+            UploadId=upload_id,
+            PartNumber=1,
+            Body=body,
+        )
+
+        listed = proxy_client.list_parts(Bucket=bucket, Key=key, UploadId=upload_id)
+        assert listed["Bucket"] == bucket
+        assert listed["Key"] == key
+        assert len(listed["Parts"]) == 1
+        assert listed["Parts"][0]["PartNumber"] == 1
+        assert listed["Parts"][0]["Size"] == len(body)
+
+        completed_response = proxy_client.complete_multipart_upload(
+            Bucket=bucket,
+            Key=key,
+            UploadId=upload_id,
+            MultipartUpload={
+                "Parts": [
+                    {
+                        "ETag": uploaded["ETag"],
+                        "PartNumber": 1,
+                    }
+                ]
+            },
+        )
+        completed = True
+        assert completed_response["Bucket"] == bucket
+        assert completed_response["Key"] == key
+    finally:
+        if upload_id and not completed:
+            proxy_client.abort_multipart_upload(Bucket=bucket, Key=key, UploadId=upload_id)
+
+    fetched = proxy_client.get_object(Bucket=bucket, Key=key)["Body"].read()
+    assert fetched == body
+
+    overlay_head = overlay_client.head_object(Bucket=overlay_bucket, Key=f"{bucket}/{key}")
+    assert overlay_head["ContentLength"] == len(body)
+
+    with pytest.raises(botocore.exceptions.ClientError) as origin_error:
+        origin_client.head_object(Bucket=bucket, Key=key)
+    assert origin_error.value.response.get("ResponseMetadata", {}).get("HTTPStatusCode") == 404
+
+    abort_key = f"multipart/abort-{random.randint(1000, 9999)}"
+    abort_upload = proxy_client.create_multipart_upload(Bucket=bucket, Key=abort_key)
+    abort_upload_id = abort_upload["UploadId"]
+    proxy_client.upload_part(
+        Bucket=bucket,
+        Key=abort_key,
+        UploadId=abort_upload_id,
+        PartNumber=1,
+        Body=b"aborted upload body",
+    )
+    proxy_client.abort_multipart_upload(Bucket=bucket, Key=abort_key, UploadId=abort_upload_id)
+
+    with pytest.raises(botocore.exceptions.ClientError) as list_error:
+        proxy_client.list_parts(Bucket=bucket, Key=abort_key, UploadId=abort_upload_id)
+    assert list_error.value.response.get("ResponseMetadata", {}).get("HTTPStatusCode") in {404, 409}
+
+    overlay_versions = overlay_client.list_object_versions(
+        Bucket=overlay_bucket,
+        Prefix=f"{bucket}/{abort_key}",
+    )
+    assert overlay_versions.get("Versions", []) == []
+    assert overlay_versions.get("DeleteMarkers", []) == []
+
+def test_copy_object_is_explicitly_unsupported():
+    print("\n=== Testing Explicit CopyObject Rejection ===\n")
+
+    proxy_client = boto3.client(
+        "s3",
+        endpoint_url="http://s3proxy:9000",
+        aws_access_key_id="origin-access",
+        aws_secret_access_key="origin-secret"
+    )
+
+    bucket = "origin-bucket1"
+    source_key = f"copy-unsupported/source-{random.randint(1000, 9999)}"
+    dest_key = f"copy-unsupported/dest-{random.randint(1000, 9999)}"
+    proxy_client.put_object(Bucket=bucket, Key=source_key, Body=b"copy source")
+
+    with pytest.raises(botocore.exceptions.ClientError) as copy_error:
+        proxy_client.copy_object(
+            Bucket=bucket,
+            Key=dest_key,
+            CopySource={"Bucket": bucket, "Key": source_key},
+        )
+    assert copy_error.value.response.get("ResponseMetadata", {}).get("HTTPStatusCode") == 501
+
+    with pytest.raises(botocore.exceptions.ClientError) as head_error:
+        proxy_client.head_object(Bucket=bucket, Key=dest_key)
+    assert head_error.value.response.get("ResponseMetadata", {}).get("HTTPStatusCode") == 404
+
 if __name__ == "__main__":
     # Parse command-line arguments
     parser = argparse.ArgumentParser(description="Run S3 proxy regression tests.")

@@ -191,6 +191,12 @@ def rewrite_overlay_path(original_path: str) -> str:
         bucket, key = parts[0], ""
     return f"{OVERLAY_BUCKET}/{bucket}/{key}"
 
+def split_bucket_key(path: str) -> tuple[str, str]:
+    parts = path.strip("/").split("/", 1)
+    if len(parts) == 2:
+        return parts[0], parts[1]
+    return parts[0], ""
+
 def append_query(url: str, query_string: str) -> str:
     if query_string:
         return f"{url}?{query_string}"
@@ -200,6 +206,9 @@ def query_has_param(query_string: str, param_name: str) -> bool:
     target = param_name.lower()
     return any(name.lower() == target for name, _ in parse_qsl(query_string, keep_blank_values=True))
 
+def is_multipart_upload_subresource(query_string: str) -> bool:
+    return query_has_param(query_string, "uploads") or query_has_param(query_string, "uploadId")
+
 def get_header(headers: dict, name: str) -> Optional[str]:
     target = name.lower()
     for key, value in headers.items():
@@ -207,10 +216,21 @@ def get_header(headers: dict, name: str) -> Optional[str]:
             return value
     return None
 
+def has_header(headers: dict, name: str) -> bool:
+    target = name.lower()
+    return any(key.lower() == target for key in headers)
+
 def precondition_failed_response() -> httpx.Response:
     return httpx.Response(
         status_code=412,
         content=b"<Error><Code>PreconditionFailed</Code><Message>At least one of the pre-conditions you specified did not hold</Message></Error>",
+        headers={"Content-Type": "application/xml"},
+    )
+
+def not_implemented_response(message: str) -> Response:
+    return Response(
+        content=f"<Error><Code>NotImplemented</Code><Message>{message}</Message></Error>".encode("utf-8"),
+        status_code=501,
         headers={"Content-Type": "application/xml"},
     )
 
@@ -223,6 +243,55 @@ def should_forward_overlay_header(name: str) -> bool:
     if lower_name.startswith("x-amz"):
         return False
     return True
+
+def virtual_object_location(request: Request, bucket: str, key: str) -> str:
+    quoted_bucket = quote(bucket, safe="")
+    quoted_key = quote(key, safe="/")
+    return f"{request.url.scheme}://{request.url.netloc}/{quoted_bucket}/{quoted_key}"
+
+def rewrite_multipart_xml_response(
+    response: httpx.Response,
+    full_path: str,
+    request: Request,
+) -> httpx.Response:
+    if response.status_code >= 400 or not response.content:
+        return response
+
+    try:
+        root = ET.fromstring(response.content)
+    except ET.ParseError:
+        return response
+
+    if root.tag.startswith("{"):
+        namespace = root.tag[1:].split("}", 1)[0]
+        ET.register_namespace("", namespace)
+
+    bucket, key = split_bucket_key(full_path)
+    location = virtual_object_location(request, bucket, key)
+    changed = False
+
+    for elem in root.iter():
+        local_name = elem.tag.rsplit("}", 1)[-1]
+        if local_name == "Bucket":
+            elem.text = bucket
+            changed = True
+        elif local_name == "Key":
+            elem.text = key
+            changed = True
+        elif local_name == "Location":
+            elem.text = location
+            changed = True
+
+    if not changed:
+        return response
+
+    headers = dict(response.headers)
+    headers.pop("content-length", None)
+    return httpx.Response(
+        status_code=response.status_code,
+        headers=headers,
+        content=ET.tostring(root, encoding="utf-8", method="xml"),
+    )
 
 async def handle_delete_request(overlay_url: str, overlay_headers: dict, body: bytes) -> httpx.Response:
     """
@@ -1344,16 +1413,24 @@ async def handle_if_none_match_star_put(
     # All checks passed, proceed with regular request flow
     return None
 
-@app.api_route("/{full_path:path}", methods=["GET", "PUT", "DELETE", "HEAD"])
+@app.api_route("/{full_path:path}", methods=["GET", "PUT", "DELETE", "HEAD", "POST"])
 async def proxy(full_path: str, request: Request):
     method = request.method
     query_string = request.url.query
     original_headers = dict(request.headers)
     body = await request.body()
+    multipart_subresource = is_multipart_upload_subresource(query_string)
     logging.info("Received %s request for %s", method, full_path)
+
+    if has_header(original_headers, "x-amz-copy-source"):
+        return not_implemented_response("CopyObject and UploadPartCopy are not implemented")
     
     # Special case: PUT with If-None-Match
-    if method == "PUT" and "if-none-match" in {k.lower() for k in original_headers.keys()}:
+    if (
+        method == "PUT"
+        and not multipart_subresource
+        and "if-none-match" in {k.lower() for k in original_headers.keys()}
+    ):
         if_none_match = get_header(original_headers, "if-none-match")
         
         # Only If-None-Match: * is allowed for PUT, return 501 for any other value
@@ -1380,7 +1457,11 @@ async def proxy(full_path: str, request: Request):
     overlay_url = append_query(f"{OVERLAY_S3_URL}/{quote(overlay_path)}", query_string)
     
     # Forward request to overlay
-    if method == "DELETE" and not query_has_param(query_string, "versionId"):
+    if (
+        method == "DELETE"
+        and not multipart_subresource
+        and not query_has_param(query_string, "versionId")
+    ):
         response = await handle_delete_request(overlay_url, overlay_headers, body)
     else:
         logging.info("Sending overlay request: %s %s", method, overlay_url)
@@ -1392,17 +1473,18 @@ async def proxy(full_path: str, request: Request):
         logging.info("Overlay response includes facilitator metadata; treating as delete marker (404)")
         response = httpx.Response(status_code=404, content=b"", headers=response.headers)
     
-    response = await handle_conditional_mutation(
-        method,
-        full_path,
-        query_string,
-        original_headers,
-        body,
-        response,
-    )
+    if not multipart_subresource:
+        response = await handle_conditional_mutation(
+            method,
+            full_path,
+            query_string,
+            original_headers,
+            body,
+            response,
+        )
     
     # Fallback to origin S3 for GET/HEAD if needed
-    if method in {"GET", "HEAD"}:
+    if method in {"GET", "HEAD"} and not multipart_subresource:
         response = await handle_get_head_fallback(
             method,
             full_path,
@@ -1411,6 +1493,9 @@ async def proxy(full_path: str, request: Request):
             body,
             response,
         )
+
+    if multipart_subresource:
+        response = rewrite_multipart_xml_response(response, full_path, request)
     
     return Response(
         content=response.content,
