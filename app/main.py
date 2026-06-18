@@ -413,6 +413,231 @@ def filter_version_by_start_time(version, start_time):
     """Return True if this version is relevant (created before START_TIME)"""
     return version["LastModified"] < start_time
 
+class VersionedKeyStream:
+    def __init__(self, s3_client, bucket, prefix, key_transform, before=None, key_marker=None):
+        self.s3_client = s3_client
+        self.bucket = bucket
+        self.prefix = prefix
+        self.key_transform = key_transform
+        self.before = before
+        self.key_marker = key_marker
+        self.version_id_marker = None
+        self.exhausted = False
+        self.buffer = []
+        self.current_key = None
+        self.current_candidate = None
+        self.skip_key = None
+
+    def next_state(self):
+        while True:
+            item = self._next_item()
+            if item is None:
+                if self.current_key is None:
+                    return None
+                return self._finish_current_key()
+
+            key = item["Key"]
+            if self.skip_key is not None:
+                if key == self.skip_key:
+                    continue
+                self.skip_key = None
+
+            if self.current_key is None:
+                self.current_key = key
+                self._consider_item(item)
+                continue
+
+            if key != self.current_key:
+                result = self._finish_current_key()
+                self.current_key = key
+                self._consider_item(item)
+                if result is not None:
+                    return result
+                continue
+
+            self._consider_item(item)
+
+    def _next_item(self):
+        while not self.buffer:
+            if self.current_key is not None and self.current_candidate is not None:
+                return None
+            if not self._fetch_next_page():
+                return None
+        return self.buffer.pop(0)
+
+    def _fetch_next_page(self):
+        if self.exhausted:
+            return False
+
+        request_params = {
+            "Bucket": self.bucket,
+            "Prefix": self.prefix,
+            "MaxKeys": 1000,
+        }
+        if self.key_marker:
+            request_params["KeyMarker"] = self.key_marker
+            if self.version_id_marker:
+                request_params["VersionIdMarker"] = self.version_id_marker
+
+        logging.info("Fetching ListObjectVersions params: %s", request_params)
+        response = self.s3_client.list_object_versions(**request_params)
+        self.key_marker = response.get("NextKeyMarker")
+        self.version_id_marker = response.get("NextVersionIdMarker")
+        self.exhausted = not response.get("IsTruncated", False)
+
+        items = []
+        for group, item_type in (("Versions", "Version"), ("DeleteMarkers", "DeleteMarker")):
+            for item in response.get(group, []):
+                key = self.key_transform(item["Key"])
+                if key is None:
+                    continue
+
+                transformed = dict(item)
+                transformed["Key"] = key
+                transformed["ItemType"] = item_type
+                items.append(transformed)
+
+        items.sort(key=lambda item: (item["Key"], -item["LastModified"].timestamp()))
+        self.buffer.extend(items)
+        return bool(self.buffer) or not self.exhausted
+
+    def _consider_item(self, item):
+        if self.before is not None and item["LastModified"] >= self.before:
+            return
+
+        if (
+            self.current_candidate is None
+            or item["LastModified"] > self.current_candidate["LastModified"]
+        ):
+            self.current_candidate = {
+                "ItemType": item["ItemType"],
+                "Key": item["Key"],
+                "LastModified": item["LastModified"],
+                "ETag": item.get("ETag", ""),
+                "Size": item.get("Size", 0),
+                "StorageClass": item.get("StorageClass", "STANDARD"),
+            }
+
+    def _finish_current_key(self):
+        result = self.current_candidate
+        if result is not None and not self.exhausted:
+            self.skip_key = self.current_key
+        self.current_key = None
+        self.current_candidate = None
+        return result
+
+def list_v2_source_marker(prefix, marker):
+    if not marker:
+        return None
+    if prefix and marker < prefix:
+        return None
+    return marker
+
+def next_stream_state(stream):
+    return stream.next_state() if stream is not None else None
+
+def choose_merged_state(origin_state, overlay_state):
+    if origin_state is None and overlay_state is None:
+        return None, False, False
+
+    if overlay_state is not None and (
+        origin_state is None or overlay_state["Key"] < origin_state["Key"]
+    ):
+        return overlay_state, False, True
+
+    if origin_state is not None and (
+        overlay_state is None or origin_state["Key"] < overlay_state["Key"]
+    ):
+        return origin_state, True, False
+
+    return overlay_state, True, True
+
+def list_v2_entry_for_state(state, prefix, delimiter):
+    key = state["Key"]
+    suffix = key[len(prefix):]
+    if delimiter is not None and delimiter and delimiter in suffix:
+        common_prefix = prefix + suffix.split(delimiter, 1)[0] + delimiter
+        return {
+            "Type": "CommonPrefix",
+            "Name": common_prefix,
+            "Prefix": common_prefix,
+        }
+
+    return {
+        "Type": "Contents",
+        "Name": key,
+        "Object": state,
+    }
+
+def collect_list_objects_v2_page(bucket, prefix, delimiter, max_keys, marker):
+    if max_keys <= 0:
+        return [], False, ""
+
+    source_marker = list_v2_source_marker(prefix, marker)
+    origin_stream = VersionedKeyStream(
+        get_origin_s3_client(),
+        bucket,
+        prefix,
+        lambda key: key,
+        before=START_TIME,
+        key_marker=source_marker,
+    )
+
+    overlay_root = f"{bucket}/"
+    overlay_source_marker = f"{overlay_root}{source_marker}" if source_marker else None
+    overlay_stream = VersionedKeyStream(
+        get_overlay_s3_client(),
+        OVERLAY_BUCKET,
+        f"{overlay_root}{prefix}",
+        lambda key: key[len(overlay_root):] if key.startswith(overlay_root) else None,
+        key_marker=overlay_source_marker,
+    )
+
+    origin_state = next_stream_state(origin_stream)
+    overlay_state = next_stream_state(overlay_stream)
+    entries = []
+    seen_common_prefixes = set()
+    next_token = ""
+
+    while True:
+        state, consume_origin, consume_overlay = choose_merged_state(origin_state, overlay_state)
+        if state is None:
+            return entries, False, ""
+
+        if state["ItemType"] != "Version":
+            if consume_origin:
+                origin_state = next_stream_state(origin_stream)
+            if consume_overlay:
+                overlay_state = next_stream_state(overlay_stream)
+            continue
+
+        entry = list_v2_entry_for_state(state, prefix, delimiter)
+        if marker and entry["Name"] <= marker:
+            if consume_origin:
+                origin_state = next_stream_state(origin_stream)
+            if consume_overlay:
+                overlay_state = next_stream_state(overlay_stream)
+            continue
+
+        if entry["Type"] == "CommonPrefix":
+            if entry["Name"] in seen_common_prefixes:
+                if consume_origin:
+                    origin_state = next_stream_state(origin_stream)
+                if consume_overlay:
+                    overlay_state = next_stream_state(overlay_stream)
+                continue
+            seen_common_prefixes.add(entry["Name"])
+
+        if len(entries) >= max_keys:
+            return entries, True, next_token
+
+        entries.append(entry)
+        next_token = entry["Name"]
+        if consume_origin:
+            origin_state = next_stream_state(origin_stream)
+        if consume_overlay:
+            overlay_state = next_stream_state(overlay_stream)
+
 # Handle the versions logic
 def process_list_versions(bucket, prefix, delimiter, key_marker, version_id_marker, max_keys):
     """
@@ -682,114 +907,14 @@ async def list_objects_handler(bucket: str, request: Request, prefix: str = ""):
         max_keys = int(params.get("max-keys", "1000"))
         continuation_token = params.get("continuation-token")
         start_after = params.get("start-after")
-
-        def collect_latest_versions(s3_client, bucket_name, version_prefix, key_transform, before=None):
-            latest_by_key = {}
-            key_marker = None
-            version_id_marker = None
-
-            while True:
-                request_params = {
-                    "Bucket": bucket_name,
-                    "Prefix": version_prefix,
-                    "MaxKeys": 1000,
-                }
-                if key_marker:
-                    request_params["KeyMarker"] = key_marker
-                    if version_id_marker:
-                        request_params["VersionIdMarker"] = version_id_marker
-
-                logging.info("Fetching ListObjectVersions params: %s", request_params)
-                response = s3_client.list_object_versions(**request_params)
-
-                for group, item_type in (("Versions", "Version"), ("DeleteMarkers", "DeleteMarker")):
-                    for item in response.get(group, []):
-                        if before is not None and item["LastModified"] >= before:
-                            continue
-
-                        key = key_transform(item["Key"])
-                        if key is None:
-                            continue
-
-                        current = latest_by_key.get(key)
-                        if current is None or item["LastModified"] > current["LastModified"]:
-                            latest_by_key[key] = {
-                                "ItemType": item_type,
-                                "Key": key,
-                                "LastModified": item["LastModified"],
-                                "ETag": item.get("ETag", ""),
-                                "Size": item.get("Size", 0),
-                                "StorageClass": item.get("StorageClass", "STANDARD"),
-                            }
-
-                if not response.get("IsTruncated", False):
-                    return latest_by_key
-
-                key_marker = response.get("NextKeyMarker")
-                version_id_marker = response.get("NextVersionIdMarker")
-
-        s3_client_origin = get_origin_s3_client()
-        origin_latest = collect_latest_versions(
-            s3_client_origin,
+        marker = continuation_token or start_after
+        paginated, is_truncated, next_token = collect_list_objects_v2_page(
             bucket,
             prefix,
-            lambda key: key,
-            before=START_TIME,
+            delimiter,
+            max_keys,
+            marker,
         )
-        objects = {
-            key: item
-            for key, item in origin_latest.items()
-            if item["ItemType"] == "Version"
-        }
-
-        s3_client_overlay = get_overlay_s3_client()
-        overlay_root = f"{bucket}/"
-        overlay_prefix = f"{overlay_root}{prefix}"
-        overlay_latest = collect_latest_versions(
-            s3_client_overlay,
-            OVERLAY_BUCKET,
-            overlay_prefix,
-            lambda key: key[len(overlay_root):] if key.startswith(overlay_root) else None,
-        )
-        for key, item in overlay_latest.items():
-            if item["ItemType"] == "Version":
-                objects[key] = item
-            else:
-                objects.pop(key, None)
-
-        entries_by_name = {}
-        for key, obj in objects.items():
-            if prefix and not key.startswith(prefix):
-                continue
-
-            suffix = key[len(prefix):]
-            if delimiter is not None and delimiter and delimiter in suffix:
-                common_prefix = prefix + suffix.split(delimiter, 1)[0] + delimiter
-                entries_by_name.setdefault(common_prefix, {
-                    "Type": "CommonPrefix",
-                    "Name": common_prefix,
-                    "Prefix": common_prefix,
-                })
-            else:
-                entries_by_name[key] = {
-                    "Type": "Contents",
-                    "Name": key,
-                    "Object": obj,
-                }
-
-        marker = continuation_token or start_after
-        entries = sorted(entries_by_name.values(), key=lambda item: item["Name"])
-        if marker:
-            entries = [entry for entry in entries if entry["Name"] > marker]
-
-        if max_keys <= 0:
-            paginated = []
-            is_truncated = False
-            next_token = ""
-        else:
-            is_truncated = len(entries) > max_keys
-            paginated = entries[:max_keys]
-            next_token = paginated[-1]["Name"] if is_truncated and paginated else ""
 
         root = ET.Element("ListBucketResult")
         name_elem = ET.SubElement(root, "Name")
