@@ -1,0 +1,44 @@
+# Initial advisory lane for proxy-backed writable clone buckets.
+#
+# Keep this list focused on object APIs the proxy is plausibly expected to
+# support. Bucket lifecycle, IAM/STS, ACL/policy, multipart, copy, tagging,
+# encryption, S3 Select, and multi-object delete are tracked in unsupported.md.
+
+s3tests/functional/test_s3.py::test_object_head_zero_bytes
+s3tests/functional/test_s3.py::test_object_write_check_etag
+s3tests/functional/test_s3.py::test_object_write_cache_control
+s3tests/functional/test_s3.py::test_object_write_expires
+s3tests/functional/test_s3.py::test_object_write_read_update_read_delete
+s3tests/functional/test_s3.py::test_object_set_get_metadata_none_to_good
+s3tests/functional/test_s3.py::test_object_set_get_metadata_none_to_empty
+s3tests/functional/test_s3.py::test_object_set_get_metadata_overwrite_to_empty
+s3tests/functional/test_s3.py::test_object_metadata_replaced_on_put
+s3tests/functional/test_s3.py::test_object_write_file
+
+s3tests/functional/test_s3.py::test_get_object_ifmatch_good
+s3tests/functional/test_s3.py::test_get_object_ifmatch_failed
+s3tests/functional/test_s3.py::test_get_object_ifnonematch_good
+s3tests/functional/test_s3.py::test_get_object_ifnonematch_failed
+s3tests/functional/test_s3.py::test_get_object_ifmodifiedsince_good
+s3tests/functional/test_s3.py::test_get_object_ifmodifiedsince_failed
+s3tests/functional/test_s3.py::test_get_object_ifunmodifiedsince_good
+s3tests/functional/test_s3.py::test_get_object_ifunmodifiedsince_failed
+s3tests/functional/test_s3.py::test_put_object_ifmatch_good
+s3tests/functional/test_s3.py::test_put_object_ifmatch_failed
+s3tests/functional/test_s3.py::test_put_object_ifmatch_overwrite_existed_good
+s3tests/functional/test_s3.py::test_put_object_ifmatch_nonexisted_failed
+s3tests/functional/test_s3.py::test_put_object_ifnonmatch_nonexisted_good
+s3tests/functional/test_s3.py::test_put_object_ifnonmatch_overwrite_existed_failed
+
+s3tests/functional/test_s3.py::test_bucket_listv2_many
+s3tests/functional/test_s3.py::test_bucket_listv2_delimiter_basic
+s3tests/functional/test_s3.py::test_bucket_listv2_delimiter_not_exist
+s3tests/functional/test_s3.py::test_bucket_listv2_prefix_basic
+s3tests/functional/test_s3.py::test_bucket_listv2_prefix_alt
+s3tests/functional/test_s3.py::test_bucket_listv2_prefix_empty
+s3tests/functional/test_s3.py::test_bucket_listv2_prefix_none
+s3tests/functional/test_s3.py::test_bucket_listv2_prefix_not_exist
+s3tests/functional/test_s3.py::test_bucket_listv2_maxkeys_one
+s3tests/functional/test_s3.py::test_bucket_listv2_maxkeys_zero
+s3tests/functional/test_s3.py::test_bucket_listv2_maxkeys_none
+s3tests/functional/test_s3.py::test_bucket_listv2_continuationtoken

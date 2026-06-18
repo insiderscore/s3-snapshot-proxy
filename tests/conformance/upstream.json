@@ -1,0 +1,6 @@
+{
+  "name": "ceph-s3-tests",
+  "repo": "https://github.com/ceph/s3-tests.git",
+  "revision": "5522d1c351f75bc00ae0f64f742f3f095f5939d9",
+  "description": "Pinned upstream S3 compatibility suite used for advisory object API conformance checks."
+}

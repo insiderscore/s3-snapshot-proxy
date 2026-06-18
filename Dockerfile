@@ -30,3 +30,16 @@ FROM base AS test
 WORKDIR /app
 COPY tests/ ./tests
 RUN uv sync --frozen --group test --no-dev --no-install-project
+
+FROM test AS conformance
+RUN apt-get update && \
+    apt-get install -y git && \
+    apt-get clean && \
+    rm -rf /var/lib/apt/lists/*
+
+ENV S3TESTS_ROOT=/opt/s3-tests
+RUN python /app/tests/conformance/fetch_s3tests.py "$S3TESTS_ROOT" && \
+    uv pip install --system -r "$S3TESTS_ROOT/requirements.txt"
+
+WORKDIR /app
+ENTRYPOINT ["python", "/app/tests/conformance/run_s3tests.py"]

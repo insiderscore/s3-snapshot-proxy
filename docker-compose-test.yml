@@ -107,3 +107,31 @@ services:
         condition: service_healthy
     working_dir: /app/tests
     entrypoint: "pytest test_regression.py --disable-warnings --capture=no --scale-factor=100"
+
+  conformance-runner:
+    profiles:
+      - conformance
+    build:
+      context: .
+      target: conformance
+    depends_on:
+      s3proxy:
+        condition: service_healthy
+    working_dir: /app
+    environment:
+      - CONFORMANCE_PROXY_HOST=s3proxy
+      - CONFORMANCE_PROXY_PORT=9000
+      - CONFORMANCE_ORIGIN_ENDPOINT=http://minio-origin:9000
+      - CONFORMANCE_OVERLAY_ENDPOINT=http://minio-overlay:9000
+      - CONFORMANCE_OVERLAY_BUCKET=overlay
+      - CONFORMANCE_MAIN_ACCESS_KEY=origin-access
+      - CONFORMANCE_MAIN_SECRET_KEY=origin-secret
+      - CONFORMANCE_ORIGIN_ACCESS_KEY=origin-access
+      - CONFORMANCE_ORIGIN_SECRET_KEY=origin-secret
+      - CONFORMANCE_OVERLAY_ACCESS_KEY=overlay-access
+      - CONFORMANCE_OVERLAY_SECRET_KEY=overlay-secret
+      - CONFORMANCE_ARTIFACT_DIR=/app/tests/conformance/artifacts
+      - CONFORMANCE_ADVISORY=${CONFORMANCE_ADVISORY:-true}
+      - S3TESTS_ROOT=/opt/s3-tests
+    volumes:
+      - ./tests/conformance/artifacts:/app/tests/conformance/artifacts
