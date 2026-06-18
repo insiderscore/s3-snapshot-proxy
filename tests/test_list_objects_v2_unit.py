@@ -82,6 +82,14 @@ def wire_clients(monkeypatch, origin_client, overlay_client):
     monkeypatch.setattr(main, "get_overlay_s3_client", lambda: overlay_client)
 
 
+def test_rewrite_overlay_path_preserves_object_key_slashes(monkeypatch):
+    monkeypatch.setattr(main, "OVERLAY_BUCKET", "overlay")
+
+    assert main.split_bucket_key("bucket/asdf/") == ("bucket", "asdf/")
+    assert main.split_bucket_key("/bucket//leading") == ("bucket", "/leading")
+    assert main.rewrite_overlay_path("bucket/asdf/") == "overlay/bucket/asdf/"
+
+
 def test_list_v2_max_keys_zero_avoids_s3_calls(monkeypatch):
     origin_client = FakeVersionClient([{"Versions": [version("a", 1)]}])
     overlay_client = FakeVersionClient([{"Versions": [version("bucket/b", 1)]}])

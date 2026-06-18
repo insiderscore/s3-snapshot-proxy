@@ -184,15 +184,13 @@ client = httpx.AsyncClient(follow_redirects=True)
 signed_client = httpx.AsyncClient(auth=overlay_aws_auth, follow_redirects=True)
 
 def rewrite_overlay_path(original_path: str) -> str:
-    parts = original_path.strip("/").split("/", 1)
-    if len(parts) == 2:
-        bucket, key = parts
-    else:
-        bucket, key = parts[0], ""
-    return f"{OVERLAY_BUCKET}/{bucket}/{key}"
+    bucket, key = split_bucket_key(original_path)
+    if key:
+        return f"{OVERLAY_BUCKET}/{bucket}/{key}"
+    return f"{OVERLAY_BUCKET}/{bucket}"
 
 def split_bucket_key(path: str) -> tuple[str, str]:
-    parts = path.strip("/").split("/", 1)
+    parts = path.lstrip("/").split("/", 1)
     if len(parts) == 2:
         return parts[0], parts[1]
     return parts[0], ""
@@ -578,12 +576,7 @@ async def handle_precondition_failure(
     if response.status_code != 412:
         return response
 
-    # Parse bucket and key from full_path
-    parts = full_path.strip("/").split("/", 1)
-    if len(parts) == 2:
-        bucket, key = parts[0], parts[1]
-    else:
-        bucket, key = parts[0], ""
+    bucket, key = split_bucket_key(full_path)
         
     if query_has_param(query_string, "versionId"):
         logging.info("Request already specifies a version ID. Respecting original 412 response.")
@@ -1564,12 +1557,7 @@ async def handle_conditional_mutation(
     if response.status_code != 412 and not conditional_overlay_miss:
         return response
         
-    # Parse bucket and key from full_path
-    parts = full_path.strip("/").split("/", 1)
-    if len(parts) == 2:
-        bucket, key = parts
-    else:
-        bucket, key = parts[0], ""
+    bucket, key = split_bucket_key(full_path)
     
     logging.info("Conditional mutation failed with 412. Checking if condition can be satisfied via origin.")
     
@@ -1746,9 +1734,7 @@ async def handle_if_none_match_star_put(
     Handle special case for PUT requests with If-None-Match: * by checking both overlay and origin.
     Returns a Response object if the precondition is not satisfied, None if request should proceed.
     """
-    parts = full_path.split('/', 1)
-    bucket = parts[0]
-    key = parts[1] if len(parts) > 1 else ""
+    bucket, key = split_bucket_key(full_path)
     overlay_path = f"{bucket}/{key}"
     
     # Initialize the overlay S3 client
