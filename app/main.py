@@ -1058,6 +1058,136 @@ def process_list_versions(bucket, prefix, delimiter, key_marker, version_id_mark
     
     return ET.tostring(root, encoding="utf-8", method="xml")
 
+def upload_common_prefix(key: str, prefix: str, delimiter: Optional[str]) -> Optional[str]:
+    if not delimiter:
+        return None
+    remainder = key[len(prefix):]
+    if delimiter not in remainder:
+        return None
+    return f"{prefix}{remainder.split(delimiter, 1)[0]}{delimiter}"
+
+def append_principal_xml(parent, tag, principal):
+    elem = ET.SubElement(parent, tag)
+    ET.SubElement(elem, "ID").text = principal.get("ID", "")
+    ET.SubElement(elem, "DisplayName").text = principal.get("DisplayName", "")
+
+def append_upload_xml(root, upload):
+    upload_elem = ET.SubElement(root, "Upload")
+    ET.SubElement(upload_elem, "Key").text = upload["Key"]
+    ET.SubElement(upload_elem, "UploadId").text = upload["UploadId"]
+    append_principal_xml(upload_elem, "Initiator", upload.get("Initiator", {}))
+    append_principal_xml(upload_elem, "Owner", upload.get("Owner", {}))
+    ET.SubElement(upload_elem, "StorageClass").text = upload.get("StorageClass", "STANDARD")
+    initiated = upload.get("Initiated")
+    if isinstance(initiated, datetime):
+        initiated_text = initiated.isoformat()
+    else:
+        initiated_text = str(initiated or "")
+    ET.SubElement(upload_elem, "Initiated").text = initiated_text
+
+def collect_list_multipart_uploads_page(bucket, prefix, delimiter, max_uploads, key_marker, upload_id_marker):
+    s3_client_overlay = get_overlay_s3_client()
+    hidden_bucket_prefix = f"{bucket}/"
+    hidden_prefix = f"{hidden_bucket_prefix}{prefix}"
+    overlay_key_marker = f"{hidden_bucket_prefix}{key_marker}" if key_marker else None
+    marker = {}
+    if overlay_key_marker:
+        marker["KeyMarker"] = overlay_key_marker
+        if upload_id_marker:
+            marker["UploadIdMarker"] = upload_id_marker
+
+    uploads = []
+    common_prefixes = []
+    seen_common_prefixes = set()
+    next_key_marker = ""
+    next_upload_id_marker = ""
+
+    while True:
+        params = {"Bucket": OVERLAY_BUCKET, "MaxUploads": 1000}
+        params.update(marker)
+        response = s3_client_overlay.list_multipart_uploads(**params)
+        stop_scan = False
+
+        for upload in response.get("Uploads", []):
+            overlay_key = upload["Key"]
+            if not overlay_key.startswith(hidden_prefix):
+                if overlay_key > hidden_prefix and overlay_key.startswith(hidden_bucket_prefix):
+                    stop_scan = True
+                    break
+                if overlay_key > hidden_bucket_prefix and not overlay_key.startswith(hidden_bucket_prefix):
+                    return uploads, common_prefixes, False, "", ""
+                continue
+
+            virtual_key = overlay_key[len(hidden_bucket_prefix):]
+            if key_marker:
+                if virtual_key < key_marker:
+                    continue
+                if virtual_key == key_marker:
+                    if not upload_id_marker or upload["UploadId"] <= upload_id_marker:
+                        continue
+
+            common_prefix = upload_common_prefix(virtual_key, prefix, delimiter)
+            if common_prefix:
+                if common_prefix not in seen_common_prefixes:
+                    seen_common_prefixes.add(common_prefix)
+                    common_prefixes.append(common_prefix)
+                continue
+
+            if len(uploads) >= max_uploads:
+                return uploads, common_prefixes, True, next_key_marker, next_upload_id_marker
+
+            rewritten_upload = upload.copy()
+            rewritten_upload["Key"] = virtual_key
+            uploads.append(rewritten_upload)
+            next_key_marker = virtual_key
+            next_upload_id_marker = upload["UploadId"]
+
+        if stop_scan:
+            return uploads, common_prefixes, False, "", ""
+
+        if not response.get("IsTruncated"):
+            return uploads, common_prefixes, False, "", ""
+
+        marker = {}
+        if response.get("NextKeyMarker"):
+            marker["KeyMarker"] = response["NextKeyMarker"]
+        if response.get("NextUploadIdMarker"):
+            marker["UploadIdMarker"] = response["NextUploadIdMarker"]
+
+def process_list_multipart_uploads(bucket, prefix, delimiter, key_marker, upload_id_marker, max_uploads):
+    uploads, common_prefixes, is_truncated, next_key_marker, next_upload_id_marker = (
+        collect_list_multipart_uploads_page(
+            bucket,
+            prefix or "",
+            delimiter,
+            max_uploads,
+            key_marker,
+            upload_id_marker,
+        )
+    )
+
+    root = ET.Element("ListMultipartUploadsResult")
+    ET.SubElement(root, "Bucket").text = bucket
+    ET.SubElement(root, "KeyMarker").text = key_marker or ""
+    ET.SubElement(root, "UploadIdMarker").text = upload_id_marker or ""
+    if is_truncated:
+        ET.SubElement(root, "NextKeyMarker").text = next_key_marker
+        ET.SubElement(root, "NextUploadIdMarker").text = next_upload_id_marker
+    ET.SubElement(root, "Prefix").text = prefix or ""
+    if delimiter:
+        ET.SubElement(root, "Delimiter").text = delimiter
+    ET.SubElement(root, "MaxUploads").text = str(max_uploads)
+    ET.SubElement(root, "IsTruncated").text = "true" if is_truncated else "false"
+
+    for upload in uploads:
+        append_upload_xml(root, upload)
+
+    for common_prefix in common_prefixes:
+        cp_elem = ET.SubElement(root, "CommonPrefixes")
+        ET.SubElement(cp_elem, "Prefix").text = common_prefix
+
+    return ET.tostring(root, encoding="utf-8", method="xml")
+
 @app.get("/{bucket}")
 async def list_objects_handler(bucket: str, request: Request, prefix: str = ""):
     """
@@ -1065,12 +1195,28 @@ async def list_objects_handler(bucket: str, request: Request, prefix: str = ""):
 
     - If query parameter list-type=2 is present, process as ListObjectsV2.
     - If query parameter versions is present, process as ListObjectVersions.
+    - If query parameter uploads is present, process as ListMultipartUploads.
     - Otherwise, handle as a regular GET.
     """
     params = request.query_params
     list_type = params.get("list-type")
     versions = params.get("versions")
     delimiter = params.get("delimiter")
+
+    if query_has_param(request.url.query, "uploads"):
+        list_uploads_prefix = params.get("prefix", prefix or "")
+        max_uploads = int(params.get("max-uploads", "1000"))
+        key_marker = params.get("key-marker")
+        upload_id_marker = params.get("upload-id-marker")
+        xml_response = process_list_multipart_uploads(
+            bucket=bucket,
+            prefix=list_uploads_prefix,
+            delimiter=delimiter,
+            key_marker=key_marker,
+            upload_id_marker=upload_id_marker,
+            max_uploads=max_uploads,
+        )
+        return Response(content=xml_response, media_type="application/xml")
 
     if list_type == "2":
         # ----- ListObjectsV2 logic -----

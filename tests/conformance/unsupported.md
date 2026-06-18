@@ -14,8 +14,16 @@ allowlist:
 - IAM, STS, users, tenants, account policy, role policy, session policy.
 - Bucket ACLs, object ACLs, object ownership, bucket policies, anonymous access.
 - CORS, website, lifecycle, bucket logging, notifications.
-- Multipart uploads and multipart copy.
-- CopyObject and UploadPartCopy.
+- ListMultipartUploads owner/ACL variants. Basic bucket-level listing is
+  supported with virtual-bucket prefix rewriting, but owner-specific behavior
+  depends on ACL support.
+- Multipart edge cases outside the initial allowlist: duplicate
+  CompleteMultipartUpload after a successful completion, and concurrent
+  same-part resend ordering. The MinIO-backed overlay reports NoSuchUpload or
+  InvalidPart for those upstream cases, so they need an explicit support-matrix
+  decision before inclusion.
+- CopyObject and UploadPartCopy. These require source-object rewriting across
+  the virtual bucket view.
 - Multi-object delete.
 - Object tagging and bucket tagging.
 - Server-side encryption and customer-provided encryption keys.

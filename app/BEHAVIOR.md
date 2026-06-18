@@ -82,3 +82,24 @@ Handling of ListObjectsV2:
   return the first (newest) object from the collision. (FIXME: We can
   avoid this problem by hitting the REST endpoint directly and parsing
   the returned XML)
+
+Handling of multipart uploads:
+
+- Object-level multipart upload operations are write-aside operations
+  against the overlay bucket. Initiate, upload part, list parts,
+  complete, and abort requests are forwarded to the overlay object key
+  under the virtual bucket prefix.
+
+- Multipart upload subresources do not fall back to the origin bucket.
+  Upload state exists only in the overlay bucket, and an aborted upload
+  must not create a delete marker.
+
+- Bucket-level ListMultipartUploads is served from the overlay bucket with
+  the virtual bucket name applied as an overlay prefix. Returned keys,
+  common prefixes, key markers, and next key markers are rewritten back to
+  the virtual bucket view so in-progress uploads for other virtual buckets
+  in the shared overlay bucket are not exposed.
+
+- CopyObject and UploadPartCopy are intentionally rejected with 501
+  because they require source-object rewriting across the virtual
+  bucket view.

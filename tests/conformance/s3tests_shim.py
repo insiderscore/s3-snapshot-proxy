@@ -79,6 +79,44 @@ def _delete_versioned_objects(client, bucket, prefix=None):
             marker["VersionIdMarker"] = response["NextVersionIdMarker"]
 
 
+def _abort_multipart_uploads(client, bucket, prefix=None):
+    marker = {}
+    while True:
+        params = {"Bucket": bucket, "MaxUploads": 1000}
+        if prefix is not None:
+            params["Prefix"] = prefix
+        params.update(marker)
+
+        try:
+            response = client.list_multipart_uploads(**params)
+        except botocore.exceptions.ClientError as exc:
+            code = exc.response.get("Error", {}).get("Code")
+            if code in {"NoSuchBucket", "404"}:
+                return
+            raise
+
+        for upload in response.get("Uploads", []):
+            try:
+                client.abort_multipart_upload(
+                    Bucket=bucket,
+                    Key=upload["Key"],
+                    UploadId=upload["UploadId"],
+                )
+            except botocore.exceptions.ClientError as exc:
+                code = exc.response.get("Error", {}).get("Code")
+                if code not in {"NoSuchUpload", "404"}:
+                    raise
+
+        if not response.get("IsTruncated"):
+            return
+
+        marker = {}
+        if response.get("NextKeyMarker"):
+            marker["KeyMarker"] = response["NextKeyMarker"]
+        if response.get("NextUploadIdMarker"):
+            marker["UploadIdMarker"] = response["NextUploadIdMarker"]
+
+
 def _create_origin_bucket(name):
     client = _origin_client()
     try:
@@ -106,9 +144,11 @@ def _ensure_origin_versioning_enabled(name):
 
 def _cleanup_bucket(name):
     overlay_bucket = _env("CONFORMANCE_OVERLAY_BUCKET")
+    _abort_multipart_uploads(_overlay_client(), overlay_bucket, prefix=f"{name}/")
     _delete_versioned_objects(_overlay_client(), overlay_bucket, prefix=f"{name}/")
 
     origin = _origin_client()
+    _abort_multipart_uploads(origin, name)
     _delete_versioned_objects(origin, name)
     try:
         origin.delete_bucket(Bucket=name)

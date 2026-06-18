@@ -1581,6 +1581,97 @@ def test_multipart_upload_via_proxy():
     assert overlay_versions.get("Versions", []) == []
     assert overlay_versions.get("DeleteMarkers", []) == []
 
+def test_list_multipart_uploads_via_proxy():
+    print("\n=== Testing ListMultipartUploads ===\n")
+
+    proxy_client = boto3.client(
+        "s3",
+        endpoint_url="http://s3proxy:9000",
+        aws_access_key_id="origin-access",
+        aws_secret_access_key="origin-secret"
+    )
+
+    bucket = "origin-bucket1"
+    other_bucket = "origin-bucket2"
+    created_uploads = []
+
+    def create_upload(upload_bucket, key):
+        response = proxy_client.create_multipart_upload(Bucket=upload_bucket, Key=key)
+        upload_id = response["UploadId"]
+        proxy_client.upload_part(
+            Bucket=upload_bucket,
+            Key=key,
+            UploadId=upload_id,
+            PartNumber=1,
+            Body=b"pending multipart listing",
+        )
+        created_uploads.append((upload_bucket, key, upload_id))
+        return upload_id
+
+    try:
+        first_upload_id = create_upload(bucket, "multipart/list-a")
+        second_upload_id = create_upload(bucket, "multipart/list-b")
+        nested_upload_id = create_upload(bucket, "multipart/nested/list-c")
+        other_upload_id = create_upload(other_bucket, "multipart/list-leak")
+
+        response = proxy_client.list_multipart_uploads(Bucket=bucket, Prefix="multipart/")
+        uploads = response.get("Uploads", [])
+        upload_ids = {upload["UploadId"] for upload in uploads}
+        keys = {upload["Key"] for upload in uploads}
+
+        assert first_upload_id in upload_ids
+        assert second_upload_id in upload_ids
+        assert nested_upload_id in upload_ids
+        assert other_upload_id not in upload_ids
+        assert keys == {"multipart/list-a", "multipart/list-b", "multipart/nested/list-c"}
+        assert all(not key.startswith(f"{bucket}/") for key in keys)
+
+        delimited = proxy_client.list_multipart_uploads(
+            Bucket=bucket,
+            Prefix="multipart/",
+            Delimiter="/",
+        )
+        delimited_keys = {upload["Key"] for upload in delimited.get("Uploads", [])}
+        common_prefixes = {item["Prefix"] for item in delimited.get("CommonPrefixes", [])}
+        assert delimited_keys == {"multipart/list-a", "multipart/list-b"}
+        assert "multipart/nested/" in common_prefixes
+        assert all(not prefix.startswith(f"{bucket}/") for prefix in common_prefixes)
+
+        first_page = proxy_client.list_multipart_uploads(
+            Bucket=bucket,
+            Prefix="multipart/list-",
+            MaxUploads=1,
+        )
+        assert first_page["IsTruncated"] is True
+        assert "NextKeyMarker" in first_page
+        assert not first_page["NextKeyMarker"].startswith(f"{bucket}/")
+
+        next_page_args = {
+            "Bucket": bucket,
+            "Prefix": "multipart/list-",
+            "MaxUploads": 1,
+            "KeyMarker": first_page["NextKeyMarker"],
+        }
+        if "NextUploadIdMarker" in first_page:
+            next_page_args["UploadIdMarker"] = first_page["NextUploadIdMarker"]
+        second_page = proxy_client.list_multipart_uploads(**next_page_args)
+        paginated_keys = {
+            *(upload["Key"] for upload in first_page.get("Uploads", [])),
+            *(upload["Key"] for upload in second_page.get("Uploads", [])),
+        }
+        assert paginated_keys == {"multipart/list-a", "multipart/list-b"}
+    finally:
+        for upload_bucket, key, upload_id in created_uploads:
+            try:
+                proxy_client.abort_multipart_upload(
+                    Bucket=upload_bucket,
+                    Key=key,
+                    UploadId=upload_id,
+                )
+            except botocore.exceptions.ClientError as exc:
+                if exc.response.get("Error", {}).get("Code") != "NoSuchUpload":
+                    raise
+
 def test_copy_object_is_explicitly_unsupported():
     print("\n=== Testing Explicit CopyObject Rejection ===\n")
 
