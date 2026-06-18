@@ -2,16 +2,16 @@ import httpx
 from fastapi import FastAPI, Request, Response
 import os
 import argparse
-from urllib.parse import quote
+from urllib.parse import parse_qsl, quote
 from httpx_auth import AWS4Auth
 import boto3
 from datetime import datetime, timezone
 import logging
 import sys
 import xml.etree.ElementTree as ET
-from collections import defaultdict
 from typing import Optional
 import botocore.exceptions
+import hashlib
 
 # Set up logging
 logging.basicConfig(
@@ -44,6 +44,11 @@ else:
     logging.info(f"Using current time as START_TIME: {START_TIME.isoformat()}")
 
 app = FastAPI()
+
+DELETE_MARKER_FACILITATOR_METADATA = "s3-snapshot-proxy-delete-marker-facilitator"
+DELETE_MARKER_FACILITATOR_BODY = b"s3-snapshot-proxy delete marker facilitator\n"
+DELETE_MARKER_FACILITATOR_ETAG = '"' + hashlib.md5(DELETE_MARKER_FACILITATOR_BODY).hexdigest() + '"'
+LEGACY_DELETE_MARKER_FACILITATOR_ETAG = '"' + hashlib.md5(b"").hexdigest() + '"'
 
 # Configurable base URLs
 OVERLAY_S3_URL = os.environ.get("OVERLAY_S3_URL", "http://overlay-s3.local")
@@ -186,6 +191,15 @@ def rewrite_overlay_path(original_path: str) -> str:
         bucket, key = parts[0], ""
     return f"{OVERLAY_BUCKET}/{bucket}/{key}"
 
+def append_query(url: str, query_string: str) -> str:
+    if query_string:
+        return f"{url}?{query_string}"
+    return url
+
+def query_has_param(query_string: str, param_name: str) -> bool:
+    target = param_name.lower()
+    return any(name.lower() == target for name, _ in parse_qsl(query_string, keep_blank_values=True))
+
 def get_header(headers: dict, name: str) -> Optional[str]:
     target = name.lower()
     for key, value in headers.items():
@@ -210,16 +224,10 @@ def should_forward_overlay_header(name: str) -> bool:
         return False
     return True
 
-async def handle_delete_workaround(overlay_url: str, overlay_headers: dict, body: bytes) -> httpx.Response:
+async def handle_delete_request(overlay_url: str, overlay_headers: dict, body: bytes) -> httpx.Response:
     """
-    Handle DELETE requests using a facilitator object.
-    
-    1. Check if this is a conditional DELETE - if so, return 501 Not Implemented
-    2. Otherwise:
-       a. Create a zero-length facilitator object with the header x-rtwa-delete-marker-facilitator
-       b. Then delete that object so only a delete marker remains
+    Handle DELETE requests against the versioned overlay bucket.
     """
-    # First check if this is a conditional DELETE request
     conditional_headers = ["if-match", "if-none-match", "if-modified-since", "if-unmodified-since"]
     
     for header in conditional_headers:
@@ -232,20 +240,32 @@ async def handle_delete_workaround(overlay_url: str, overlay_headers: dict, body
                 headers={"Content-Type": "application/xml"}
             )
     
-    # Standard DELETE operation - proceed with facilitator object pattern
     facilitator_headers = overlay_headers.copy()
-    facilitator_headers["x-rtwa-delete-marker-facilitator"] = "true"
-    logging.info("Creating facilitator object for deletion marker workaround: PUT %s", overlay_url)
-    facilitator_response = await signed_client.put(overlay_url, headers=facilitator_headers, content=b"")
+    facilitator_headers.pop("content-length", None)
+    facilitator_headers.pop("Content-Length", None)
+    facilitator_headers[f"x-amz-meta-{DELETE_MARKER_FACILITATOR_METADATA}"] = "true"
+    logging.info("Creating facilitator object for deletion marker compatibility: PUT %s", overlay_url)
+    facilitator_response = await signed_client.put(
+        overlay_url,
+        headers=facilitator_headers,
+        content=DELETE_MARKER_FACILITATOR_BODY,
+    )
     logging.info("Facilitator creation response status: %s", facilitator_response.status_code)
-    
+    if facilitator_response.status_code >= 400:
+        return facilitator_response
+
     logging.info("Deleting facilitator object: DELETE %s", overlay_url)
     response = await signed_client.request("DELETE", overlay_url, headers=overlay_headers, content=body)
-    logging.info("Delete response (workaround) status: %s, headers: %s", response.status_code, dict(response.headers))
+    logging.info("Delete response status: %s, headers: %s", response.status_code, dict(response.headers))
     return response
 
 async def handle_precondition_failure(
-    method: str, full_path: str, original_headers: dict, body: bytes, response: httpx.Response
+    method: str,
+    full_path: str,
+    query_string: str,
+    original_headers: dict,
+    body: bytes,
+    response: httpx.Response,
 ) -> httpx.Response:
     """
     Handle precondition failures by checking object state at START_TIME
@@ -260,25 +280,17 @@ async def handle_precondition_failure(
     else:
         bucket, key = parts[0], ""
         
-    # Parse out any existing query parameters
-    key_parts = key.split("?", 1)
-    base_key = key_parts[0]
-    query_string = key_parts[1] if len(key_parts) > 1 else ""
-    
-    # Properly check if versionId parameter exists
-    from urllib.parse import parse_qsl
-    query_params = parse_qsl(query_string)
-    if any(k.lower() == "versionid" for k, v in query_params):
+    if query_has_param(query_string, "versionId"):
         logging.info("Request already specifies a version ID. Respecting original 412 response.")
         return response
 
-    logging.info("Received 412. Checking object state at START_TIME for: %s, key: %s", bucket, base_key)
+    logging.info("Received 412. Checking object state at START_TIME for: %s, key: %s", bucket, key)
     
     # Use our comprehensive function that properly handles delete markers and pagination
-    origin_obj = check_object_at_start_time(bucket, base_key)
+    origin_obj = check_object_at_start_time(bucket, key)
     
     if origin_obj is None:
-        logging.info("No matching version found for key %s before START_TIME. Returning 404.", base_key)
+        logging.info("No matching version found for key %s before START_TIME. Returning 404.", key)
         return httpx.Response(status_code=404, content=b"")
 
     version_id = origin_obj.get("VersionId")
@@ -290,10 +302,10 @@ async def handle_precondition_failure(
     # Construct URL with minimal changes
     if query_string:
         # Use & to append to existing query parameters
-        origin_url = f"{ORIGIN_S3_URL}/{bucket}/{quote(base_key)}?{query_string}&{version_param}"
+        origin_url = f"{ORIGIN_S3_URL}/{bucket}/{quote(key)}?{query_string}&{version_param}"
     else:
         # No existing query params, use ?
-        origin_url = f"{ORIGIN_S3_URL}/{bucket}/{quote(base_key)}?{version_param}"
+        origin_url = f"{ORIGIN_S3_URL}/{bucket}/{quote(key)}?{version_param}"
     
     new_response = await client.request(
         method, origin_url, headers=original_headers, auth=origin_aws_auth, content=body
@@ -303,6 +315,7 @@ async def handle_precondition_failure(
 async def handle_get_head_fallback(
     method: str,
     full_path: str,
+    query_string: str,
     original_headers: dict,
     body: bytes,
     response: httpx.Response
@@ -314,7 +327,7 @@ async def handle_get_head_fallback(
     """
     if method in {"GET", "HEAD"} and response.status_code == 404:
         if response.headers.get("x-amz-delete-marker", "false").lower() != "true":
-            origin_url = f"{ORIGIN_S3_URL}/{quote(full_path)}"
+            origin_url = append_query(f"{ORIGIN_S3_URL}/{quote(full_path)}", query_string)
             origin_headers = original_headers.copy()
 
             proxy_start_str = START_TIME.strftime("%a, %d %b %Y %H:%M:%S GMT")
@@ -336,7 +349,14 @@ async def handle_get_head_fallback(
             new_response = await client.request(method, origin_url, headers=origin_headers, content=body)
             logging.info("Origin response status: %s", new_response.status_code)
             if new_response.status_code == 412:
-                new_response = await handle_precondition_failure(method, full_path, original_headers, body, new_response)
+                new_response = await handle_precondition_failure(
+                    method,
+                    full_path,
+                    query_string,
+                    original_headers,
+                    body,
+                    new_response,
+                )
             return new_response
     return response
 
@@ -413,14 +433,279 @@ def filter_version_by_start_time(version, start_time):
     """Return True if this version is relevant (created before START_TIME)"""
     return version["LastModified"] < start_time
 
+def response_has_facilitator_metadata(headers) -> bool:
+    header_name = f"x-amz-meta-{DELETE_MARKER_FACILITATOR_METADATA}"
+    legacy_header_name = "x-rtwa-delete-marker-facilitator"
+    return (
+        headers.get(header_name, "false").lower() == "true"
+        or headers.get(legacy_header_name, "false").lower() == "true"
+    )
+
+def is_facilitator_version(s3_client, bucket, key, version):
+    possible_current = (
+        version.get("Size") == len(DELETE_MARKER_FACILITATOR_BODY)
+        and version.get("ETag") == DELETE_MARKER_FACILITATOR_ETAG
+    )
+    possible_legacy = (
+        version.get("Size") == 0
+        and version.get("ETag") == LEGACY_DELETE_MARKER_FACILITATOR_ETAG
+    )
+    if not possible_current and not possible_legacy:
+        return False
+
+    try:
+        response = s3_client.head_object(
+            Bucket=bucket,
+            Key=key,
+            VersionId=version.get("VersionId"),
+        )
+    except Exception as exc:
+        logging.info("Unable to inspect possible facilitator version %s/%s: %s", bucket, key, exc)
+        return False
+
+    metadata = response.get("Metadata", {})
+    return (
+        metadata.get(DELETE_MARKER_FACILITATOR_METADATA, "false").lower() == "true"
+        or response_has_facilitator_metadata(response.get("ResponseMetadata", {}).get("HTTPHeaders", {}))
+    )
+
+def version_item_sort_key(item):
+    last_modified = item.get("LastModified")
+    timestamp = last_modified.timestamp() if isinstance(last_modified, datetime) else 0
+    return (
+        item["Key"],
+        -timestamp,
+        item.get("VersionId", ""),
+        item.get("ItemType", ""),
+        item.get("Source", ""),
+    )
+
+def choose_merged_version_item(origin_item, overlay_item):
+    if origin_item is None and overlay_item is None:
+        return None, False, False
+    if origin_item is None:
+        return overlay_item, False, True
+    if overlay_item is None:
+        return origin_item, True, False
+    if version_item_sort_key(origin_item) <= version_item_sort_key(overlay_item):
+        return origin_item, True, False
+    return overlay_item, False, True
+
+class VersionItemStream:
+    def __init__(
+        self,
+        s3_client,
+        bucket,
+        prefix,
+        key_transform,
+        source,
+        before=None,
+        key_marker=None,
+        version_id_marker=None,
+        skip_facilitators=False,
+    ):
+        self.s3_client = s3_client
+        self.bucket = bucket
+        self.prefix = prefix
+        self.key_transform = key_transform
+        self.source = source
+        self.before = before
+        self.key_marker = key_marker
+        self.version_id_marker = version_id_marker
+        self.skip_facilitators = skip_facilitators
+        self.exhausted = False
+        self.buffer = []
+
+    def next_item(self):
+        while not self.buffer:
+            if not self._fetch_next_page():
+                return None
+        return self.buffer.pop(0)
+
+    def _fetch_next_page(self):
+        if self.exhausted:
+            return False
+
+        request_params = {
+            "Bucket": self.bucket,
+            "Prefix": self.prefix,
+            "MaxKeys": 1000,
+        }
+        if self.key_marker:
+            request_params["KeyMarker"] = self.key_marker
+            if self.version_id_marker:
+                request_params["VersionIdMarker"] = self.version_id_marker
+
+        logging.info("Fetching ListObjectVersions params: %s", request_params)
+        response = self.s3_client.list_object_versions(**request_params)
+        self.key_marker = response.get("NextKeyMarker")
+        self.version_id_marker = response.get("NextVersionIdMarker")
+        self.exhausted = not response.get("IsTruncated", False)
+
+        items = []
+        for group, item_type in (("Versions", "Version"), ("DeleteMarkers", "DeleteMarker")):
+            for item in response.get(group, []):
+                original_key = item["Key"]
+                key = self.key_transform(original_key)
+                if key is None:
+                    continue
+                if self.before is not None and item["LastModified"] >= self.before:
+                    continue
+                if (
+                    self.skip_facilitators
+                    and item_type == "Version"
+                    and is_facilitator_version(self.s3_client, self.bucket, original_key, item)
+                ):
+                    continue
+
+                transformed = dict(item)
+                transformed["Key"] = key
+                transformed["ItemType"] = item_type
+                transformed["Source"] = self.source
+                transformed["OriginalKey"] = original_key
+                items.append(transformed)
+
+        items.sort(key=version_item_sort_key)
+        self.buffer.extend(items)
+        return bool(self.buffer) or not self.exhausted
+
+def next_version_item(stream):
+    return stream.next_item() if stream is not None else None
+
+def version_item_after_marker(item, key_marker, version_id_marker, marker_seen):
+    if not key_marker:
+        return True, marker_seen
+    if item["Key"] < key_marker:
+        return False, marker_seen
+    if item["Key"] > key_marker:
+        return True, marker_seen
+    if not version_id_marker:
+        return False, marker_seen
+    if marker_seen:
+        return True, marker_seen
+    if item.get("VersionId", "") == version_id_marker:
+        return False, True
+    return False, marker_seen
+
+def list_versions_entry_for_item(item, prefix, delimiter):
+    key = item["Key"]
+    suffix = key[len(prefix):]
+    if delimiter is not None and delimiter and delimiter in suffix:
+        common_prefix = prefix + suffix.split(delimiter, 1)[0] + delimiter
+        return {
+            "Type": "CommonPrefix",
+            "Name": common_prefix,
+            "Prefix": common_prefix,
+            "MarkerKey": common_prefix,
+            "MarkerVersionId": "",
+        }
+
+    return {
+        "Type": item["ItemType"],
+        "Name": key,
+        "Object": item,
+        "MarkerKey": key,
+        "MarkerVersionId": item.get("VersionId", ""),
+    }
+
+def collect_list_object_versions_page(bucket, prefix, delimiter, max_keys, key_marker, version_id_marker):
+    if max_keys <= 0:
+        return [], False, "", ""
+
+    use_source_marker = key_marker if key_marker and not version_id_marker else None
+    origin_stream = VersionItemStream(
+        get_origin_s3_client(),
+        bucket,
+        prefix or "",
+        lambda key: key,
+        "origin",
+        before=START_TIME,
+        key_marker=use_source_marker,
+    )
+
+    overlay_root = f"{bucket}/"
+    overlay_source_marker = f"{overlay_root}{use_source_marker}" if use_source_marker else None
+    overlay_stream = VersionItemStream(
+        get_overlay_s3_client(),
+        OVERLAY_BUCKET,
+        f"{overlay_root}{prefix or ''}",
+        lambda key: key[len(overlay_root):] if key.startswith(overlay_root) else None,
+        "overlay",
+        key_marker=overlay_source_marker,
+        skip_facilitators=True,
+    )
+
+    origin_item = next_version_item(origin_stream)
+    overlay_item = next_version_item(overlay_stream)
+    entries = []
+    seen_common_prefixes = set()
+    latest_seen_keys = {key_marker} if key_marker and version_id_marker else set()
+    marker_seen = not key_marker
+    next_key_marker = ""
+    next_version_id_marker = ""
+
+    while True:
+        item, consume_origin, consume_overlay = choose_merged_version_item(origin_item, overlay_item)
+        if item is None:
+            return entries, False, "", ""
+
+        after_marker, marker_seen = version_item_after_marker(
+            item,
+            key_marker,
+            version_id_marker,
+            marker_seen,
+        )
+        if not after_marker:
+            latest_seen_keys.add(item["Key"])
+            if consume_origin:
+                origin_item = next_version_item(origin_stream)
+            if consume_overlay:
+                overlay_item = next_version_item(overlay_stream)
+            continue
+
+        entry = list_versions_entry_for_item(item, prefix or "", delimiter)
+        if entry["Type"] == "CommonPrefix":
+            if entry["Name"] in seen_common_prefixes:
+                if consume_origin:
+                    origin_item = next_version_item(origin_stream)
+                if consume_overlay:
+                    overlay_item = next_version_item(overlay_stream)
+                continue
+            seen_common_prefixes.add(entry["Name"])
+        else:
+            obj = entry["Object"]
+            obj["IsLatest"] = obj["Key"] not in latest_seen_keys
+            latest_seen_keys.add(obj["Key"])
+
+        if len(entries) >= max_keys:
+            return entries, True, next_key_marker, next_version_id_marker
+
+        entries.append(entry)
+        next_key_marker = entry["MarkerKey"]
+        next_version_id_marker = entry["MarkerVersionId"]
+        if consume_origin:
+            origin_item = next_version_item(origin_stream)
+        if consume_overlay:
+            overlay_item = next_version_item(overlay_stream)
+
 class VersionedKeyStream:
-    def __init__(self, s3_client, bucket, prefix, key_transform, before=None, key_marker=None):
+    def __init__(
+        self,
+        s3_client,
+        bucket,
+        prefix,
+        key_transform,
+        before=None,
+        key_marker=None,
+        skip_facilitators=False,
+    ):
         self.s3_client = s3_client
         self.bucket = bucket
         self.prefix = prefix
         self.key_transform = key_transform
         self.before = before
         self.key_marker = key_marker
+        self.skip_facilitators = skip_facilitators
         self.version_id_marker = None
         self.exhausted = False
         self.buffer = []
@@ -488,8 +773,15 @@ class VersionedKeyStream:
         items = []
         for group, item_type in (("Versions", "Version"), ("DeleteMarkers", "DeleteMarker")):
             for item in response.get(group, []):
-                key = self.key_transform(item["Key"])
+                original_key = item["Key"]
+                key = self.key_transform(original_key)
                 if key is None:
+                    continue
+                if (
+                    self.skip_facilitators
+                    and item_type == "Version"
+                    and is_facilitator_version(self.s3_client, self.bucket, original_key, item)
+                ):
                     continue
 
                 transformed = dict(item)
@@ -591,6 +883,7 @@ def collect_list_objects_v2_page(bucket, prefix, delimiter, max_keys, marker):
         f"{overlay_root}{prefix}",
         lambda key: key[len(overlay_root):] if key.startswith(overlay_root) else None,
         key_marker=overlay_source_marker,
+        skip_facilitators=True,
     )
 
     origin_state = next_stream_state(origin_stream)
@@ -641,211 +934,20 @@ def collect_list_objects_v2_page(bucket, prefix, delimiter, max_keys, marker):
 # Handle the versions logic
 def process_list_versions(bucket, prefix, delimiter, key_marker, version_id_marker, max_keys):
     """
-    Process ListObjectVersions request by merging results from origin and overlay
-    with proper pagination and filtering
+    Process ListObjectVersions request by streaming merged origin and overlay entries.
     """
-    # STEP 1: Get versions from origin that were created before START_TIME
-    s3_client_origin = get_origin_s3_client()
-    origin_versions = []
-    origin_delete_markers = []
-    origin_common_prefixes = set()
-    
-    # Paginate through all object versions from origin
-    is_truncated = True
-    origin_key_marker = key_marker
-    origin_version_id_marker = version_id_marker
-    
-    while is_truncated:
-        origin_params = {
-            "Bucket": bucket, 
-            "Prefix": prefix or "",
-            "MaxKeys": 1000  # Use maximum allowed for efficiency
-        }
-        
-        if delimiter:
-            origin_params["Delimiter"] = delimiter
-            
-        if origin_key_marker:
-            origin_params["KeyMarker"] = origin_key_marker
-            if origin_version_id_marker:
-                origin_params["VersionIdMarker"] = origin_version_id_marker
-        
-        logging.info(f"Origin ListObjectVersions params: {origin_params}")
-        origin_resp = s3_client_origin.list_object_versions(**origin_params)
-        
-        # Process versions that existed before START_TIME
-        if "Versions" in origin_resp:
-            for ver in origin_resp["Versions"]:
-                if filter_version_by_start_time(ver, START_TIME):
-                    # Annotate with source and add ItemType for XML generation
-                    ver["Source"] = "origin"
-                    ver["ItemType"] = "Version"
-                    origin_versions.append(ver)
-        
-        # Process delete markers that existed before START_TIME
-        if "DeleteMarkers" in origin_resp:
-            for dm in origin_resp["DeleteMarkers"]:
-                if filter_version_by_start_time(dm, START_TIME):
-                    dm["Source"] = "origin"
-                    dm["ItemType"] = "DeleteMarker"
-                    origin_delete_markers.append(dm)
-                    
-        # Process common prefixes if delimiter is specified
-        if "CommonPrefixes" in origin_resp:
-            for cp in origin_resp["CommonPrefixes"]:
-                origin_common_prefixes.add(cp["Prefix"])
-        
-        # Update markers for next iteration
-        is_truncated = origin_resp.get('IsTruncated', False)
-        if is_truncated:
-            origin_key_marker = origin_resp.get('NextKeyMarker')
-            origin_version_id_marker = origin_resp.get('NextVersionIdMarker')
-        else:
-            break
-    
-    # STEP 2: Get versions from overlay bucket
-    s3_client_overlay = get_overlay_s3_client()
-    overlay_versions = []
-    overlay_delete_markers = []
-    overlay_common_prefixes = set()
-    
-    # Calculate overlay prefix
-    overlay_prefix = f"{bucket}/"
-    if prefix:
-        overlay_prefix = f"{bucket}/{prefix}"
-    
-    # Paginate through overlay versions
-    is_truncated = True
-    overlay_key_marker = None
-    overlay_version_id_marker = None
-    
-    if key_marker:
-        # Need to transform the key marker for overlay
-        overlay_key_marker = f"{bucket}/{key_marker}"
-    
-    while is_truncated:
-        overlay_params = {
-            "Bucket": OVERLAY_BUCKET,
-            "Prefix": overlay_prefix,
-            "MaxKeys": 1000
-        }
-        
-        if delimiter:
-            # Need to adjust delimiter handling for the overlay bucket
-            # because keys are prefixed with the bucket name
-            overlay_params["Delimiter"] = delimiter
-        
-        if overlay_key_marker:
-            overlay_params["KeyMarker"] = overlay_key_marker
-            if overlay_version_id_marker:
-                overlay_params["VersionIdMarker"] = overlay_version_id_marker
-        
-        logging.info(f"Overlay ListObjectVersions params: {overlay_params}")
-        overlay_resp = s3_client_overlay.list_object_versions(**overlay_params)
-        
-        # Process overlay versions
-        if "Versions" in overlay_resp:
-            for ver in overlay_resp["Versions"]:
-                # Strip bucket prefix from key for comparison
-                original_key = ver["Key"]
-                if original_key.startswith(f"{bucket}/"):
-                    ver["Key"] = original_key[len(f"{bucket}/"):]
-                    ver["Source"] = "overlay"
-                    ver["ItemType"] = "Version"
-                    ver["OriginalKey"] = original_key  # Keep original for reference
-                    overlay_versions.append(ver)
-        
-        # Process overlay delete markers
-        if "DeleteMarkers" in overlay_resp:
-            for dm in overlay_resp["DeleteMarkers"]:
-                original_key = dm["Key"]
-                if original_key.startswith(f"{bucket}/"):
-                    dm["Key"] = original_key[len(f"{bucket}/"):]
-                    dm["Source"] = "overlay"
-                    dm["ItemType"] = "DeleteMarker"
-                    dm["OriginalKey"] = original_key
-                    overlay_delete_markers.append(dm)
-        
-        # Process overlay common prefixes
-        if "CommonPrefixes" in overlay_resp:
-            for cp in overlay_resp["CommonPrefixes"]:
-                prefix_val = cp["Prefix"]
-                if prefix_val.startswith(f"{bucket}/"):
-                    # Strip the bucket prefix for consistency
-                    adjusted_prefix = prefix_val[len(f"{bucket}/"):]
-                    overlay_common_prefixes.add(adjusted_prefix)
-        
-        # Update markers for next iteration
-        is_truncated = overlay_resp.get('IsTruncated', False)
-        if is_truncated:
-            overlay_key_marker = overlay_resp.get('NextKeyMarker')
-            overlay_version_id_marker = overlay_resp.get('NextVersionIdMarker')
-        else:
-            break
-    
-    # STEP 3: Merge results from origin and overlay
-    # Create a dictionary to track the latest versions for each key
-    all_versions = origin_versions + overlay_versions
-    all_delete_markers = origin_delete_markers + overlay_delete_markers
-    
-    # Merge common prefixes
-    all_common_prefixes = origin_common_prefixes.union(overlay_common_prefixes)
-    
-    # Build a comprehensive version history for each key
-    key_versions = defaultdict(list)
-    
-    # Add all versions
-    for ver in all_versions:
-        key = ver["Key"]
-        key_versions[key].append(ver)
-    
-    # Add all delete markers
-    for dm in all_delete_markers:
-        key = dm["Key"]
-        key_versions[key].append(dm)
-    
-    # For each key, sort versions by LastModified (newest first)
-    merged_list = []
-    for key, versions in key_versions.items():
-        versions.sort(key=lambda x: x["LastModified"], reverse=True)
-        
-        # Mark the newest version as IsLatest
-        if versions:
-            versions[0]["IsLatest"] = True
-            for v in versions[1:]:
-                v["IsLatest"] = False
-            
-        merged_list.extend(versions)
-    
-    # Sort the entire merged list by Key and then by LastModified (newest first)
-    merged_list.sort(key=lambda x: (x["Key"], -x["LastModified"].timestamp() if isinstance(x["LastModified"], datetime) else 0))
-    
-    # STEP 4: Handle pagination
-    if key_marker:
-        # Find the position after key_marker to start returning results
-        start_pos = 0
-        for i, item in enumerate(merged_list):
-            if item["Key"] > key_marker or (item["Key"] == key_marker and item.get("VersionId", "") > version_id_marker):
-                start_pos = i
-                break
-        merged_list = merged_list[start_pos:]
-    
-    # Limit results to max_keys
-    is_truncated = len(merged_list) > max_keys
-    paginated_list = merged_list[:max_keys]
-    
-    # Get next markers if truncated
-    next_key_marker = ""
-    next_version_id_marker = ""
-    if is_truncated and paginated_list:
-        last_item = paginated_list[-1]
-        next_key_marker = last_item["Key"]
-        next_version_id_marker = last_item.get("VersionId", "")
-    
-    # STEP 5: Generate XML response
+    entries, is_truncated, next_key_marker, next_version_id_marker = (
+        collect_list_object_versions_page(
+            bucket,
+            prefix or "",
+            delimiter,
+            max_keys,
+            key_marker,
+            version_id_marker,
+        )
+    )
+
     root = ET.Element("ListVersionsResult")
-    
-    # Add required elements
     ET.SubElement(root, "Name").text = bucket
     ET.SubElement(root, "Prefix").text = prefix or ""
     if key_marker:
@@ -861,14 +963,14 @@ def process_list_versions(bucket, prefix, delimiter, key_marker, version_id_mark
     
     if delimiter:
         ET.SubElement(root, "Delimiter").text = delimiter
-    
-    # Add CommonPrefixes
-    for prefix_val in sorted(all_common_prefixes):
-        cp_elem = ET.SubElement(root, "CommonPrefixes")
-        ET.SubElement(cp_elem, "Prefix").text = prefix_val
-    
-    # Add Versions and DeleteMarkers
-    for item in paginated_list:
+
+    for entry in entries:
+        if entry["Type"] == "CommonPrefix":
+            cp_elem = ET.SubElement(root, "CommonPrefixes")
+            ET.SubElement(cp_elem, "Prefix").text = entry["Prefix"]
+            continue
+
+        item = entry["Object"]
         if item["ItemType"] == "Version":
             ver_elem = ET.SubElement(root, "Version")
             ET.SubElement(ver_elem, "Key").text = item["Key"]
@@ -988,7 +1090,12 @@ async def list_objects_handler(bucket: str, request: Request, prefix: str = ""):
         return {"message": f"Regular GET for bucket: {bucket} with prefix: {prefix}"}
 
 async def handle_conditional_mutation(
-    method: str, full_path: str, original_headers: dict, body: bytes, response: httpx.Response
+    method: str,
+    full_path: str,
+    query_string: str,
+    original_headers: dict,
+    body: bytes,
+    response: httpx.Response,
 ) -> httpx.Response:
     """
     Handle conditional write (PUT) and delete (DELETE) requests that fail with 412 Precondition Failed.
@@ -1070,7 +1177,7 @@ async def handle_conditional_mutation(
             modified_headers["If-None-Match"] = "*"
             
             overlay_path = rewrite_overlay_path(full_path)
-            overlay_url = f"{OVERLAY_S3_URL}/{quote(overlay_path)}"
+            overlay_url = append_query(f"{OVERLAY_S3_URL}/{quote(overlay_path)}", query_string)
             
             new_response = await signed_client.request(
                 method, overlay_url, headers=modified_headers, content=body
@@ -1240,6 +1347,7 @@ async def handle_if_none_match_star_put(
 @app.api_route("/{full_path:path}", methods=["GET", "PUT", "DELETE", "HEAD"])
 async def proxy(full_path: str, request: Request):
     method = request.method
+    query_string = request.url.query
     original_headers = dict(request.headers)
     body = await request.body()
     logging.info("Received %s request for %s", method, full_path)
@@ -1269,26 +1377,40 @@ async def proxy(full_path: str, request: Request):
         if should_forward_overlay_header(k)
     }
     overlay_path = rewrite_overlay_path(full_path)
-    overlay_url = f"{OVERLAY_S3_URL}/{quote(overlay_path)}"
+    overlay_url = append_query(f"{OVERLAY_S3_URL}/{quote(overlay_path)}", query_string)
     
     # Forward request to overlay
-    if method == "DELETE":
-        response = await handle_delete_workaround(overlay_url, overlay_headers, body)
+    if method == "DELETE" and not query_has_param(query_string, "versionId"):
+        response = await handle_delete_request(overlay_url, overlay_headers, body)
     else:
         logging.info("Sending overlay request: %s %s", method, overlay_url)
         response = await signed_client.request(method, overlay_url, headers=overlay_headers, content=body)
         logging.info("Overlay response status: %s, headers: %s", response.status_code, dict(response.headers))
     
-    # For GET/HEAD, if the overlay response includes the facilitator header, treat it as delete marker.
-    if method in {"GET", "HEAD"} and response.headers.get("x-rtwa-delete-marker-facilitator", "false").lower() == "true":
-        logging.info("Overlay response includes facilitator header; treating as delete marker (404)")
+    # For GET/HEAD, if the overlay response includes facilitator metadata, treat it as delete marker.
+    if method in {"GET", "HEAD"} and response_has_facilitator_metadata(response.headers):
+        logging.info("Overlay response includes facilitator metadata; treating as delete marker (404)")
         response = httpx.Response(status_code=404, content=b"", headers=response.headers)
     
-    response = await handle_conditional_mutation(method, full_path, original_headers, body, response)
+    response = await handle_conditional_mutation(
+        method,
+        full_path,
+        query_string,
+        original_headers,
+        body,
+        response,
+    )
     
     # Fallback to origin S3 for GET/HEAD if needed
     if method in {"GET", "HEAD"}:
-        response = await handle_get_head_fallback(method, full_path, original_headers, body, response)
+        response = await handle_get_head_fallback(
+            method,
+            full_path,
+            query_string,
+            original_headers,
+            body,
+            response,
+        )
     
     return Response(
         content=response.content,

@@ -1072,6 +1072,7 @@ def test_multiple_versions_before_start_time():
     # Find objects that have multiple versions before START_TIME
     paginator = origin_client.get_paginator("list_object_versions")
     multi_version_candidates = {}
+    pre_start_delete_markers = {}
     
     for page in paginator.paginate(Bucket=bucket):
         if 'Versions' in page:
@@ -1089,6 +1090,17 @@ def test_multiple_versions_before_start_time():
                         'LastModified': last_modified,
                         'ETag': version['ETag']
                     })
+
+        if 'DeleteMarkers' in page:
+            for delete_marker in page['DeleteMarkers']:
+                key = delete_marker['Key']
+                last_modified = delete_marker['LastModified']
+
+                if last_modified < start_time:
+                    pre_start_delete_markers.setdefault(key, []).append({
+                        'VersionId': delete_marker['VersionId'],
+                        'LastModified': last_modified,
+                    })
     
     # Find objects with multiple versions before START_TIME and not in overlay
     suitable_objects = []
@@ -1097,6 +1109,14 @@ def test_multiple_versions_before_start_time():
         if len(versions) >= 2:  # At least 2 versions before START_TIME
             # Sort versions by LastModified (newest first)
             versions.sort(key=lambda x: x['LastModified'], reverse=True)
+
+            delete_markers = sorted(
+                pre_start_delete_markers.get(key, []),
+                key=lambda x: x['LastModified'],
+                reverse=True,
+            )
+            if delete_markers and delete_markers[0]['LastModified'] > versions[0]['LastModified']:
+                continue
             
             # Check if object exists in overlay
             overlay_path = f"{bucket}/{key}"
