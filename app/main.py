@@ -678,167 +678,119 @@ async def list_objects_handler(bucket: str, request: Request, prefix: str = ""):
 
     if list_type == "2":
         # ----- ListObjectsV2 logic -----
+        prefix = params.get("prefix", prefix or "")
         max_keys = int(params.get("max-keys", "1000"))
         continuation_token = params.get("continuation-token")
+        start_after = params.get("start-after")
 
-        # STEP 1: Get ALL versions from origin to find the latest version before START_TIME
-        s3_client_origin = boto3.client(
-            "s3",
-            aws_access_key_id=origin_credentials.access_key,
-            aws_secret_access_key=origin_credentials.secret_key,
-            aws_session_token=origin_credentials.token,
-            endpoint_url=ORIGIN_S3_URL
-        )
-        logging.info("Querying origin versions with Prefix: %s", prefix or "")
-        origin_params = {"Bucket": bucket, "Prefix": prefix or ""}
-        if delimiter:
-            origin_params["Delimiter"] = delimiter
-        # Note: We can't use continuation_token here since list_object_versions uses different pagination      
-        
-        # Paginate through all object versions
-        is_truncated = True
-        key_marker = None
-        version_id_marker = None
-        
-        # Initialize dictionaries to track objects and common prefixes
-        objects = {}  # key: object key, value: latest version before START_TIME
-        deleted_keys = set()  # Track keys that were deleted as of START_TIME
-        
-        while is_truncated:
-            logging.info("Fetching paginated result for ListObjectVersions params: %s", origin_params)
-            if key_marker:
-                origin_params["KeyMarker"] = key_marker
-                origin_params["VersionIdMarker"] = version_id_marker
-                
-            origin_resp = s3_client_origin.list_object_versions(**origin_params)
-            
-            # Process versions from origin, keeping only the latest version before START_TIME for each key
-            if "Versions" in origin_resp:
-                for ver in origin_resp["Versions"]:
-                    key = ver["Key"]
-                    # Skip keys that were known to be deleted
-                    if key in deleted_keys:
-                        continue
-                    # Only consider versions from before START_TIME
-                    if ver["LastModified"] < START_TIME:
-                        # If we haven't seen this key before, or this version is newer than what we have
-                        if key not in objects or ver["LastModified"] > objects[key]["LastModified"]:
-                            objects[key] = {
-                                "Key": key,
-                                "LastModified": ver["LastModified"],
-                                "ETag": ver.get("ETag", ""),
-                                "Size": ver.get("Size", 0),
-                                "StorageClass": ver.get("StorageClass", "STANDARD")
-                            }
-            
-            # Process delete markers from origin
-            if "DeleteMarkers" in origin_resp:
-                for dm in origin_resp["DeleteMarkers"]:
-                    key = dm["Key"]
-                    # Only consider delete markers from before START_TIME
-                    if dm["LastModified"] < START_TIME:
-                        # If this delete marker is newer than any existing version we have for the key
-                        # or if we haven't seen this key before, mark it as deleted
-                        if key not in objects or dm["LastModified"] > objects[key]["LastModified"]:
-                            deleted_keys.add(key)
-                            if key in objects:
-                                del objects[key]
-            
-            # Update markers for next iteration
-            is_truncated = origin_resp.get('IsTruncated', False)
-            if is_truncated:
-                key_marker = origin_resp.get('NextKeyMarker')
-                version_id_marker = origin_resp.get('NextVersionIdMarker')
-            else:
-                break
-        
-        # Process common prefixes from origin
-        origin_common_prefixes = []
-        if "CommonPrefixes" in origin_resp:
-            origin_common_prefixes = origin_resp["CommonPrefixes"]
+        def collect_latest_versions(s3_client, bucket_name, version_prefix, key_transform, before=None):
+            latest_by_key = {}
+            key_marker = None
+            version_id_marker = None
 
-        # STEP 2: Get version information from overlay to handle overlays and deletes
-        s3_client_overlay = boto3.client(
-            "s3",
-            aws_access_key_id=overlay_credentials.access_key,
-            aws_secret_access_key=overlay_credentials.secret_key,
-            aws_session_token=overlay_credentials.token,
-            endpoint_url=OVERLAY_S3_URL
-        )
-        
-        overlay_prefix = f"{bucket}/"
-        if prefix:
-            overlay_prefix = f"{bucket}/{prefix}"
-            
-        logging.info("Querying overlay bucket with Prefix: %s", overlay_prefix)
-        overlay_params = {"Bucket": OVERLAY_BUCKET, "Prefix": overlay_prefix}
-        if delimiter:
-            overlay_params["Delimiter"] = delimiter
-        
-        logging.info("Overlay query parameters: %s", overlay_params)
-        overlay_resp = s3_client_overlay.list_object_versions(**overlay_params)
-        
-        # Process versions from overlay
-        if "Versions" in overlay_resp:
-            for ver in overlay_resp["Versions"]:
-                key_val = ver["Key"]
-                if key_val.startswith(f"{bucket}/"):
-                    key_val = key_val[len(f"{bucket}/"):]
-                
-                # Add new objects from overlay or replace origin objects
-                objects[key_val] = {
-                    "Key": key_val,
-                    "LastModified": ver["LastModified"],
-                    "ETag": ver.get("ETag", ""),
-                    "Size": ver.get("Size", 0),
-                    "StorageClass": ver.get("StorageClass", "STANDARD")
+            while True:
+                request_params = {
+                    "Bucket": bucket_name,
+                    "Prefix": version_prefix,
+                    "MaxKeys": 1000,
                 }
-        
-        # Process delete markers from overlay
-        if "DeleteMarkers" in overlay_resp:
-            for dm in overlay_resp["DeleteMarkers"]:
-                key_val = dm["Key"]
-                if key_val.startswith(f"{bucket}/"):
-                    key_val = key_val[len(f"{bucket}/"):]
-                
-                # Remove objects that have delete markers
-                if key_val in objects:
-                    del objects[key_val]
-        
-        # STEP 3: Handle common prefixes from overlay
-        overlay_common_prefixes = []
-        if "CommonPrefixes" in overlay_resp:
-            for cp in overlay_resp["CommonPrefixes"]:
-                prefix_val = cp["Prefix"]
-                if prefix_val.startswith(f"{bucket}/"):
-                    prefix_val = prefix_val[len(f"{bucket}/"):]
-                overlay_common_prefixes.append({"Prefix": prefix_val})
-        
-        # Merge common prefixes
-        all_common_prefixes = origin_common_prefixes + overlay_common_prefixes
-        
-        # STEP 4: Build final list and paginate
-        final_objects = list(objects.values())
-        
-        # Sort objects by Key lexicographically (required for ListObjectsV2)
-        final_objects.sort(key=lambda x: x["Key"])
-        
-        # Handle pagination
-        if continuation_token:
-            # Find start position based on continuation token
-            start_pos = 0
-            for i, obj in enumerate(final_objects):
-                if obj["Key"] > continuation_token:
-                    start_pos = i
-                    break
-            final_objects = final_objects[start_pos:]
-        
-        # Limit results
-        is_truncated = len(final_objects) > max_keys
-        paginated = final_objects[:max_keys]
-        next_token = paginated[-1]["Key"] if is_truncated and paginated else ""
-        
-        # STEP 5: Build XML response per ListObjectsV2 schema
+                if key_marker:
+                    request_params["KeyMarker"] = key_marker
+                    if version_id_marker:
+                        request_params["VersionIdMarker"] = version_id_marker
+
+                logging.info("Fetching ListObjectVersions params: %s", request_params)
+                response = s3_client.list_object_versions(**request_params)
+
+                for group, item_type in (("Versions", "Version"), ("DeleteMarkers", "DeleteMarker")):
+                    for item in response.get(group, []):
+                        if before is not None and item["LastModified"] >= before:
+                            continue
+
+                        key = key_transform(item["Key"])
+                        if key is None:
+                            continue
+
+                        current = latest_by_key.get(key)
+                        if current is None or item["LastModified"] > current["LastModified"]:
+                            latest_by_key[key] = {
+                                "ItemType": item_type,
+                                "Key": key,
+                                "LastModified": item["LastModified"],
+                                "ETag": item.get("ETag", ""),
+                                "Size": item.get("Size", 0),
+                                "StorageClass": item.get("StorageClass", "STANDARD"),
+                            }
+
+                if not response.get("IsTruncated", False):
+                    return latest_by_key
+
+                key_marker = response.get("NextKeyMarker")
+                version_id_marker = response.get("NextVersionIdMarker")
+
+        s3_client_origin = get_origin_s3_client()
+        origin_latest = collect_latest_versions(
+            s3_client_origin,
+            bucket,
+            prefix,
+            lambda key: key,
+            before=START_TIME,
+        )
+        objects = {
+            key: item
+            for key, item in origin_latest.items()
+            if item["ItemType"] == "Version"
+        }
+
+        s3_client_overlay = get_overlay_s3_client()
+        overlay_root = f"{bucket}/"
+        overlay_prefix = f"{overlay_root}{prefix}"
+        overlay_latest = collect_latest_versions(
+            s3_client_overlay,
+            OVERLAY_BUCKET,
+            overlay_prefix,
+            lambda key: key[len(overlay_root):] if key.startswith(overlay_root) else None,
+        )
+        for key, item in overlay_latest.items():
+            if item["ItemType"] == "Version":
+                objects[key] = item
+            else:
+                objects.pop(key, None)
+
+        entries_by_name = {}
+        for key, obj in objects.items():
+            if prefix and not key.startswith(prefix):
+                continue
+
+            suffix = key[len(prefix):]
+            if delimiter is not None and delimiter and delimiter in suffix:
+                common_prefix = prefix + suffix.split(delimiter, 1)[0] + delimiter
+                entries_by_name.setdefault(common_prefix, {
+                    "Type": "CommonPrefix",
+                    "Name": common_prefix,
+                    "Prefix": common_prefix,
+                })
+            else:
+                entries_by_name[key] = {
+                    "Type": "Contents",
+                    "Name": key,
+                    "Object": obj,
+                }
+
+        marker = continuation_token or start_after
+        entries = sorted(entries_by_name.values(), key=lambda item: item["Name"])
+        if marker:
+            entries = [entry for entry in entries if entry["Name"] > marker]
+
+        if max_keys <= 0:
+            paginated = []
+            is_truncated = False
+            next_token = ""
+        else:
+            is_truncated = len(entries) > max_keys
+            paginated = entries[:max_keys]
+            next_token = paginated[-1]["Name"] if is_truncated and paginated else ""
+
         root = ET.Element("ListBucketResult")
         name_elem = ET.SubElement(root, "Name")
         name_elem.text = bucket
@@ -848,9 +800,16 @@ async def list_objects_handler(bucket: str, request: Request, prefix: str = ""):
         keycount_elem.text = str(len(paginated))
         maxkeys_elem = ET.SubElement(root, "MaxKeys")
         maxkeys_elem.text = str(max_keys)
+        if delimiter is not None:
+            delimiter_elem = ET.SubElement(root, "Delimiter")
+            delimiter_elem.text = delimiter
         trunc_elem = ET.SubElement(root, "IsTruncated")
         trunc_elem.text = "true" if is_truncated else "false"
         
+        if start_after:
+            start_after_elem = ET.SubElement(root, "StartAfter")
+            start_after_elem.text = start_after
+
         if continuation_token:
             token_elem = ET.SubElement(root, "ContinuationToken")
             token_elem.text = continuation_token
@@ -859,14 +818,14 @@ async def list_objects_handler(bucket: str, request: Request, prefix: str = ""):
             next_token_elem = ET.SubElement(root, "NextContinuationToken")
             next_token_elem.text = next_token
         
-        # Add CommonPrefixes
-        for cp in all_common_prefixes:
-            cp_elem = ET.SubElement(root, "CommonPrefixes")
-            prefix_elem_cp = ET.SubElement(cp_elem, "Prefix")
-            prefix_elem_cp.text = cp["Prefix"]
-        
-        # Add Contents
-        for obj in paginated:
+        for entry in paginated:
+            if entry["Type"] == "CommonPrefix":
+                cp_elem = ET.SubElement(root, "CommonPrefixes")
+                prefix_elem_cp = ET.SubElement(cp_elem, "Prefix")
+                prefix_elem_cp.text = entry["Prefix"]
+                continue
+
+            obj = entry["Object"]
             cont_elem = ET.SubElement(root, "Contents")
             key_elem = ET.SubElement(cont_elem, "Key")
             key_elem.text = obj["Key"]
