@@ -5,7 +5,7 @@ This directory carries an advisory S3 compatibility lane for writable clone buck
 ## Shape
 
 - `upstream.json` pins the upstream repository and revision.
-- `allowlist.txt` selects the initial object, conditional, and ListObjectsV2 cases.
+- `allowlist.txt` selects the initial object, conditional, ListObjectsV2, and versioned-object listing cases.
 - `unsupported.md` is the explicit ledger for APIs outside the current support claim.
 - `run_s3tests.py` generates `s3tests.conf`, injects the fixture shim, runs pytest, and emits JUnit, JSON, and Markdown artifacts.
 - `s3tests_shim.py` patches only the fixture boundary: buckets are provisioned in origin with versioning enabled, object operations still target the proxy, and cleanup removes origin versions plus overlay keys under `<bucket>/`.

@@ -9,6 +9,8 @@ allowlist:
 
 - Bucket administration: create bucket, delete bucket, list buckets, bucket
   location, bucket ownership controls.
+- Bucket versioning administration: origin and overlay buckets must already
+  have versioning enabled; the shim provisions this at the fixture boundary.
 - IAM, STS, users, tenants, account policy, role policy, session policy.
 - Bucket ACLs, object ACLs, object ownership, bucket policies, anonymous access.
 - CORS, website, lifecycle, bucket logging, notifications.

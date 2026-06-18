@@ -97,6 +97,12 @@ def _create_origin_bucket(name):
         CREATED_BUCKETS.append(name)
     return name
 
+def _ensure_origin_versioning_enabled(name):
+    _origin_client().put_bucket_versioning(
+        Bucket=name,
+        VersioningConfiguration={"Status": "Enabled"},
+    )
+
 
 def _cleanup_bucket(name):
     overlay_bucket = _env("CONFORMANCE_OVERLAY_BUCKET")
@@ -175,3 +181,20 @@ def install():
 
     # Leave a cheap breadcrumb in pytest output for debugging fixture issues.
     print(f"installed s3-snapshot-proxy conformance shim from {Path(__file__)}")
+
+
+def patch_collected_tests():
+    import sys
+
+    test_s3 = sys.modules.get("s3tests.functional.test_s3")
+    if test_s3 is None:
+        return
+
+    def patched_check_configure_versioning_retry(bucket_name, status, expected_string):
+        if status != "Enabled" or expected_string != "Enabled":
+            raise AssertionError(
+                "proxy conformance fixture only supports mandatory Enabled origin versioning"
+            )
+        _ensure_origin_versioning_enabled(bucket_name)
+
+    test_s3.check_configure_versioning_retry = patched_check_configure_versioning_retry

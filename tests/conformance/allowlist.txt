@@ -42,3 +42,8 @@ s3tests/functional/test_s3.py::test_bucket_listv2_maxkeys_one
 s3tests/functional/test_s3.py::test_bucket_listv2_maxkeys_zero
 s3tests/functional/test_s3.py::test_bucket_listv2_maxkeys_none
 s3tests/functional/test_s3.py::test_bucket_listv2_continuationtoken
+
+s3tests/functional/test_s3.py::test_versioning_obj_list_marker
+s3tests/functional/test_s3.py::test_versioning_stack_delete_merkers
+s3tests/functional/test_s3.py::test_versioning_obj_create_versions_remove_all
+s3tests/functional/test_s3.py::test_versioning_obj_create_versions_remove_special_names

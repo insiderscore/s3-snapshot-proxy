@@ -122,6 +122,9 @@ def inject_conftest(root):
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     module.install()
+
+    def pytest_collection_modifyitems(session, config, items):
+        module.patch_collected_tests()
     """
     existing = conftest.read_text() if conftest.exists() else ""
     if marker not in existing:
