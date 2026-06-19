@@ -2,7 +2,7 @@
 #
 # Keep this list focused on object APIs the proxy is plausibly expected to
 # support. Bucket lifecycle, IAM/STS, ACL/policy, multipart copy, copy,
-# tagging, KMS/SSE-C encryption, and S3 Select are tracked in unsupported.md.
+# bucket tagging, KMS/SSE-C encryption, and S3 Select are tracked in unsupported.md.
 
 s3tests/functional/test_s3.py::test_object_head_zero_bytes
 s3tests/functional/test_s3.py::test_object_write_check_etag
@@ -102,3 +102,7 @@ s3tests/functional/test_s3.py::test_sse_s3_encrypted_upload_1b
 s3tests/functional/test_s3.py::test_sse_s3_encrypted_upload_1kb
 s3tests/functional/test_s3.py::test_sse_s3_encrypted_upload_1mb
 s3tests/functional/test_s3.py::test_sse_s3_encrypted_upload_8mb
+
+s3tests/functional/test_s3.py::test_get_obj_tagging
+s3tests/functional/test_s3.py::test_get_obj_head_tagging
+s3tests/functional/test_s3.py::test_set_multipart_tagging
