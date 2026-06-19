@@ -81,6 +81,25 @@ def facilitator_head():
     }
 
 
+def tag_facilitator_version(key, seconds, version_id="tag-facilitator-version"):
+    return version(
+        key,
+        seconds,
+        size=len(main.TAG_FACILITATOR_BODY),
+        version_id=version_id,
+        etag=main.TAG_FACILITATOR_ETAG,
+    )
+
+
+def tag_facilitator_head():
+    return {
+        "Metadata": {
+            main.TAG_FACILITATOR_METADATA: "true",
+        },
+        "ResponseMetadata": {"HTTPHeaders": {}},
+    }
+
+
 def invalid_object_name_error():
     return botocore.exceptions.ClientError(
         {
@@ -215,6 +234,31 @@ def test_list_v2_ignores_overlay_delete_marker_facilitator(monkeypatch):
     )
 
     assert entries == []
+    assert is_truncated is False
+    assert next_token == ""
+    assert len(overlay_client.head_calls) == 1
+
+
+def test_list_v2_ignores_overlay_tag_facilitator(monkeypatch):
+    origin_client = FakeVersionClient([
+        {"Versions": [version("a", 1)]}
+    ])
+    overlay_client = FakeVersionClient(
+        [
+            {
+                "Versions": [tag_facilitator_version("bucket/a", 3)],
+            }
+        ],
+        heads={("bucket/a", "tag-facilitator-version"): tag_facilitator_head()},
+    )
+    wire_clients(monkeypatch, origin_client, overlay_client)
+
+    entries, is_truncated, next_token = main.collect_list_objects_v2_page(
+        "bucket", "", None, 10, None
+    )
+
+    assert [(entry["Type"], entry["Name"]) for entry in entries] == [("Contents", "a")]
+    assert entries[0]["Object"]["ETag"] == '"etag-a-1"'
     assert is_truncated is False
     assert next_token == ""
     assert len(overlay_client.head_calls) == 1
@@ -361,6 +405,32 @@ def test_list_versions_ignores_overlay_delete_marker_facilitator(monkeypatch):
 
     assert [(entry["Type"], entry["Name"]) for entry in entries] == [("DeleteMarker", "a")]
     assert entries[0]["Object"]["IsLatest"] is True
+    assert is_truncated is False
+    assert next_key_marker == ""
+    assert next_version_id_marker == ""
+    assert len(overlay_client.head_calls) == 1
+
+
+def test_list_versions_ignores_overlay_tag_facilitator(monkeypatch):
+    origin_client = FakeVersionClient([
+        {"Versions": [version("a", 1)]}
+    ])
+    overlay_client = FakeVersionClient(
+        [
+            {
+                "Versions": [tag_facilitator_version("bucket/a", 3)],
+            }
+        ],
+        heads={("bucket/a", "tag-facilitator-version"): tag_facilitator_head()},
+    )
+    wire_clients(monkeypatch, origin_client, overlay_client)
+
+    entries, is_truncated, next_key_marker, next_version_id_marker = (
+        main.collect_list_object_versions_page("bucket", "", None, 10, None, None)
+    )
+
+    assert [(entry["Type"], entry["Name"]) for entry in entries] == [("Version", "a")]
+    assert entries[0]["Object"]["ETag"] == '"etag-a-1"'
     assert is_truncated is False
     assert next_key_marker == ""
     assert next_version_id_marker == ""

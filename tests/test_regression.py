@@ -69,6 +69,31 @@ def overlay_has_key_history(overlay_client, overlay_bucket, overlay_path):
                 return True
     return False
 
+def overlay_key_version_ids(overlay_client, overlay_bucket, overlay_path):
+    version_ids = set()
+    paginator = overlay_client.get_paginator("list_object_versions")
+    for page in paginator.paginate(Bucket=overlay_bucket, Prefix=overlay_path):
+        for item in page.get("Versions", []) + page.get("DeleteMarkers", []):
+            if item.get("Key") == overlay_path:
+                version_ids.add(item["VersionId"])
+    return version_ids
+
+def delete_overlay_key_history(overlay_client, overlay_bucket, overlay_path, preserve_version_ids=None):
+    preserve_version_ids = preserve_version_ids or set()
+    versions_to_delete = []
+    paginator = overlay_client.get_paginator("list_object_versions")
+    for page in paginator.paginate(Bucket=overlay_bucket, Prefix=overlay_path):
+        for item in page.get("Versions", []) + page.get("DeleteMarkers", []):
+            if item.get("Key") == overlay_path and item["VersionId"] not in preserve_version_ids:
+                versions_to_delete.append(item["VersionId"])
+
+    for version_id in versions_to_delete:
+        overlay_client.delete_object(
+            Bucket=overlay_bucket,
+            Key=overlay_path,
+            VersionId=version_id,
+        )
+
 def find_pre_start_origin_object(origin_client, proxy_client, overlay_client, bucket, start_time, overlay_bucket):
     candidates = {}
     paginator = origin_client.get_paginator("list_object_versions")
@@ -109,6 +134,40 @@ def find_pre_start_origin_object(origin_client, proxy_client, overlay_client, bu
         return key, newest_version["ETag"], newest_version["LastModified"]
 
     pytest.fail(f"Could not find a pre-start origin object visible through proxy for bucket {bucket}")
+
+def find_visible_origin_version(origin_client, bucket, key, start_time):
+    paginator = origin_client.get_paginator("list_object_versions")
+    candidate = None
+    candidate_time = None
+    latest_delete_marker_time = None
+
+    for page in paginator.paginate(Bucket=bucket, Prefix=key):
+        for version in page.get("Versions", []):
+            if version["Key"] != key or version["LastModified"] >= start_time:
+                continue
+            if candidate is None or version["LastModified"] > candidate_time:
+                candidate = version
+                candidate_time = version["LastModified"]
+
+        for marker in page.get("DeleteMarkers", []):
+            if marker["Key"] != key or marker["LastModified"] >= start_time:
+                continue
+            if latest_delete_marker_time is None or marker["LastModified"] > latest_delete_marker_time:
+                latest_delete_marker_time = marker["LastModified"]
+
+    if candidate is None or (
+        latest_delete_marker_time is not None
+        and latest_delete_marker_time > candidate_time
+    ):
+        pytest.fail(f"Could not resolve visible origin version for {bucket}/{key}")
+
+    return candidate
+
+def tag_pairs(response):
+    return {
+        (tag["Key"], tag["Value"])
+        for tag in response.get("TagSet", [])
+    }
 
 # Test the proxy
 def test_proxy(scale_factor):
@@ -1631,6 +1690,135 @@ def test_multi_object_delete_version_scope():
     }
     assert (overlay_key, overlay_version_id) in retry_deleted
     assert retry_response.get("Errors", [])[0]["Key"] == origin_key
+
+def test_origin_object_tagging_facilitator():
+    print("\n=== Testing Origin Object Tagging Facilitator ===\n")
+
+    health_data = requests.get("http://s3proxy:9000/health").json()
+    start_time = datetime.fromisoformat(health_data["startTime"])
+    overlay_bucket = health_data.get("overlayBucket", "overlay")
+
+    origin_client = boto3.client(
+        "s3",
+        endpoint_url="http://minio-origin:9000",
+        aws_access_key_id="origin-access",
+        aws_secret_access_key="origin-secret"
+    )
+    overlay_client = boto3.client(
+        "s3",
+        endpoint_url=health_data.get("overlayS3", "http://minio-overlay:9000"),
+        aws_access_key_id="overlay-access",
+        aws_secret_access_key="overlay-secret"
+    )
+    proxy_client = boto3.client(
+        "s3",
+        endpoint_url="http://s3proxy:9000",
+        aws_access_key_id="origin-access",
+        aws_secret_access_key="origin-secret"
+    )
+
+    bucket = "origin-bucket1"
+    key, origin_etag, _ = find_pre_start_origin_object(
+        origin_client,
+        proxy_client,
+        overlay_client,
+        bucket,
+        start_time,
+        overlay_bucket,
+    )
+    origin_version = find_visible_origin_version(origin_client, bucket, key, start_time)
+    origin_version_id = origin_version["VersionId"]
+    overlay_path = f"{bucket}/{key}"
+    before_overlay_version_ids = overlay_key_version_ids(overlay_client, overlay_bucket, overlay_path)
+
+    original_origin_tags = origin_client.get_object_tagging(
+        Bucket=bucket,
+        Key=key,
+        VersionId=origin_version_id,
+    )
+    origin_tags = {
+        "TagSet": [
+            {"Key": "source", "Value": "origin"},
+            {"Key": "state", "Value": "before-facilitator"},
+        ]
+    }
+    overlay_tags = {
+        "TagSet": [
+            {"Key": "source", "Value": "overlay"},
+            {"Key": "state", "Value": "retagged"},
+        ]
+    }
+
+    original_object = proxy_client.get_object(Bucket=bucket, Key=key)
+    original_body = original_object["Body"].read()
+    before_versions = proxy_client.list_object_versions(Bucket=bucket, Prefix=key)
+    before_version_ids = {
+        (item["Key"], item["VersionId"])
+        for item in before_versions.get("Versions", [])
+        if item["Key"] == key
+    }
+
+    try:
+        origin_client.put_object_tagging(
+            Bucket=bucket,
+            Key=key,
+            VersionId=origin_version_id,
+            Tagging=origin_tags,
+        )
+        assert tag_pairs(proxy_client.get_object_tagging(Bucket=bucket, Key=key)) == tag_pairs(origin_tags)
+
+        proxy_client.put_object_tagging(Bucket=bucket, Key=key, Tagging=overlay_tags)
+        assert tag_pairs(proxy_client.get_object_tagging(Bucket=bucket, Key=key)) == tag_pairs(overlay_tags)
+        assert tag_pairs(
+            origin_client.get_object_tagging(
+                Bucket=bucket,
+                Key=key,
+                VersionId=origin_version_id,
+            )
+        ) == tag_pairs(origin_tags)
+
+        proxy_head = proxy_client.head_object(Bucket=bucket, Key=key)
+        assert proxy_head["ETag"] == origin_etag
+        assert proxy_head["ContentLength"] == len(original_body)
+        assert proxy_client.get_object(Bucket=bucket, Key=key)["Body"].read() == original_body
+
+        overlay_head = overlay_client.head_object(Bucket=overlay_bucket, Key=overlay_path)
+        assert overlay_head["Metadata"]["s3-snapshot-proxy-tag-facilitator"] == "true"
+
+        listed = proxy_client.list_objects_v2(Bucket=bucket, Prefix=key)
+        assert key in {item["Key"] for item in listed.get("Contents", [])}
+
+        after_versions = proxy_client.list_object_versions(Bucket=bucket, Prefix=key)
+        after_version_ids = {
+            (item["Key"], item["VersionId"])
+            for item in after_versions.get("Versions", [])
+            if item["Key"] == key
+        }
+        assert after_version_ids == before_version_ids
+
+        proxy_client.delete_object_tagging(Bucket=bucket, Key=key)
+        assert tag_pairs(proxy_client.get_object_tagging(Bucket=bucket, Key=key)) == set()
+        assert proxy_client.get_object(Bucket=bucket, Key=key)["Body"].read() == original_body
+    finally:
+        if original_origin_tags.get("TagSet"):
+            origin_client.put_object_tagging(
+                Bucket=bucket,
+                Key=key,
+                VersionId=origin_version_id,
+                Tagging=original_origin_tags,
+            )
+        else:
+            origin_client.delete_object_tagging(
+                Bucket=bucket,
+                Key=key,
+                VersionId=origin_version_id,
+            )
+        delete_overlay_key_history(
+            overlay_client,
+            overlay_bucket,
+            overlay_path,
+            preserve_version_ids=before_overlay_version_ids,
+        )
 
 def test_multipart_upload_via_proxy():
     print("\n=== Testing Multipart Uploads ===\n")

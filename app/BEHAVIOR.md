@@ -137,5 +137,13 @@ Handling of object tagging:
   that already exist in the overlay view. This includes tags supplied during
   multipart upload initiation.
 
-- Tagging objects that exist only in the origin bucket is not handled by the
-  overlay-only pass-through path.
+- GET Object Tagging for objects that exist only in the origin bucket reads
+  tags from the origin version visible at proxy start.
+
+- PUT Object Tagging and DELETE Object Tagging for origin-only objects create a
+  small overlay facilitator object marked with proxy metadata, then store the
+  tag state on that overlay version. Normal GET/HEAD/ListObjectsV2/
+  ListObjectVersions handling hides this facilitator and continues to expose
+  the origin object body and metadata.
+
+- Version-specific tagging requests are not remapped to origin versions.

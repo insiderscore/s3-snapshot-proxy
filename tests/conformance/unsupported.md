@@ -30,9 +30,10 @@ allowlist:
   version-specific batch deletes are supported. Version IDs that exist only in
   the origin bucket return item-level failures because the proxy must never
   mutate origin bucket versions.
-- Bucket tagging and origin-only object tagging. Object tagging on objects
-  already materialized in the overlay bucket is supported, including multipart
-  upload tagging.
+- Bucket tagging and version-specific origin object tagging. Object tagging on
+  objects already materialized in the overlay bucket is supported, including
+  multipart upload tagging. Unversioned object tagging for origin-only objects
+  is supported through an overlay facilitator object.
 - Bucket encryption administration, default bucket encryption behavior, explicit
   SSE-KMS key selection, and customer-provided encryption keys. Explicit
   SSE-S3 object uploads are supported when the overlay backend has KMS

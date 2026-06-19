@@ -49,6 +49,9 @@ DELETE_MARKER_FACILITATOR_METADATA = "s3-snapshot-proxy-delete-marker-facilitato
 DELETE_MARKER_FACILITATOR_BODY = b"s3-snapshot-proxy delete marker facilitator\n"
 DELETE_MARKER_FACILITATOR_ETAG = '"' + hashlib.md5(DELETE_MARKER_FACILITATOR_BODY).hexdigest() + '"'
 LEGACY_DELETE_MARKER_FACILITATOR_ETAG = '"' + hashlib.md5(b"").hexdigest() + '"'
+TAG_FACILITATOR_METADATA = "s3-snapshot-proxy-tag-facilitator"
+TAG_FACILITATOR_BODY = b"s3-snapshot-proxy tag facilitator\n"
+TAG_FACILITATOR_ETAG = '"' + hashlib.md5(TAG_FACILITATOR_BODY).hexdigest() + '"'
 
 # Configurable base URLs
 OVERLAY_S3_URL = os.environ.get("OVERLAY_S3_URL", "http://overlay-s3.local")
@@ -242,6 +245,20 @@ def s3_error_response(code: str, message: str, status_code: int) -> Response:
         headers={"Content-Type": "application/xml"},
     )
 
+def filtered_response_headers(headers) -> dict:
+    return {
+        k: v
+        for k, v in headers.items()
+        if k.lower() not in {"content-encoding", "transfer-encoding"}
+    }
+
+def response_from_httpx(response: httpx.Response) -> Response:
+    return Response(
+        content=response.content,
+        status_code=response.status_code,
+        headers=filtered_response_headers(response.headers),
+    )
+
 def should_forward_overlay_header(name: str) -> bool:
     lower_name = name.lower()
     if lower_name.startswith("authorization"):
@@ -339,6 +356,86 @@ async def handle_delete_request(overlay_url: str, overlay_headers: dict, body: b
     response = await signed_client.request("DELETE", overlay_url, headers=overlay_headers, content=body)
     logging.info("Delete response status: %s, headers: %s", response.status_code, dict(response.headers))
     return response
+
+def tagging_xml_response(tag_set) -> Response:
+    root = ET.Element("Tagging")
+    tagset_elem = ET.SubElement(root, "TagSet")
+    for tag in tag_set:
+        tag_elem = ET.SubElement(tagset_elem, "Tag")
+        ET.SubElement(tag_elem, "Key").text = tag.get("Key", "")
+        ET.SubElement(tag_elem, "Value").text = tag.get("Value", "")
+    return Response(
+        content=ET.tostring(root, encoding="utf-8", method="xml"),
+        media_type="application/xml",
+    )
+
+def overlay_current_version_is_delete_marker(overlay_key: str) -> bool:
+    s3_client_overlay = get_overlay_s3_client()
+    try:
+        s3_client_overlay.head_object(Bucket=OVERLAY_BUCKET, Key=overlay_key)
+        return False
+    except botocore.exceptions.ClientError as exc:
+        headers = exc.response.get("ResponseMetadata", {}).get("HTTPHeaders", {})
+        return (get_header(headers, "x-amz-delete-marker") or "").lower() == "true"
+
+async def create_tag_facilitator_object(overlay_object_url: str) -> httpx.Response:
+    headers = {
+        f"x-amz-meta-{TAG_FACILITATOR_METADATA}": "true",
+    }
+    logging.info("Creating tag facilitator object: PUT %s", overlay_object_url)
+    return await signed_client.put(
+        overlay_object_url,
+        headers=headers,
+        content=TAG_FACILITATOR_BODY,
+    )
+
+async def handle_object_tagging_request(
+    method: str,
+    full_path: str,
+    query_string: str,
+    original_headers: dict,
+    body: bytes,
+) -> Response:
+    bucket, key = split_bucket_key(full_path)
+    if not key:
+        return not_implemented_response("Bucket tagging is not implemented")
+
+    overlay_headers = {
+        k: v for k, v in original_headers.items()
+        if should_forward_overlay_header(k)
+    }
+    overlay_path = rewrite_overlay_path(full_path)
+    overlay_object_url = f"{OVERLAY_S3_URL}/{quote(overlay_path)}"
+    overlay_url = append_query(overlay_object_url, query_string)
+
+    response = await signed_client.request(method, overlay_url, headers=overlay_headers, content=body)
+    if response.status_code != 404 or query_has_param(query_string, "versionId"):
+        return response_from_httpx(response)
+
+    origin_obj = check_object_at_start_time(bucket, key)
+    if origin_obj is None or overlay_current_version_is_delete_marker(overlay_path):
+        return response_from_httpx(response)
+
+    if method == "GET":
+        try:
+            tagging = get_origin_s3_client().get_object_tagging(
+                Bucket=bucket,
+                Key=key,
+                VersionId=origin_obj["VersionId"],
+            )
+        except botocore.exceptions.ClientError:
+            return response_from_httpx(response)
+        return tagging_xml_response(tagging.get("TagSet", []))
+
+    if method not in {"PUT", "DELETE"}:
+        return response_from_httpx(response)
+
+    facilitator_response = await create_tag_facilitator_object(overlay_object_url)
+    if facilitator_response.status_code >= 400:
+        return response_from_httpx(facilitator_response)
+
+    response = await signed_client.request(method, overlay_url, headers=overlay_headers, content=body)
+    return response_from_httpx(response)
 
 def xml_local_name(tag: str) -> str:
     return tag.rsplit("}", 1)[-1]
@@ -739,9 +836,13 @@ def response_has_facilitator_metadata(headers) -> bool:
     header_name = f"x-amz-meta-{DELETE_MARKER_FACILITATOR_METADATA}"
     legacy_header_name = "x-rtwa-delete-marker-facilitator"
     return (
-        headers.get(header_name, "false").lower() == "true"
-        or headers.get(legacy_header_name, "false").lower() == "true"
+        (get_header(headers, header_name) or "false").lower() == "true"
+        or (get_header(headers, legacy_header_name) or "false").lower() == "true"
     )
+
+def response_has_tag_facilitator_metadata(headers) -> bool:
+    header_name = f"x-amz-meta-{TAG_FACILITATOR_METADATA}"
+    return (get_header(headers, header_name) or "false").lower() == "true"
 
 def is_facilitator_version(s3_client, bucket, key, version):
     possible_current = (
@@ -769,6 +870,30 @@ def is_facilitator_version(s3_client, bucket, key, version):
     return (
         metadata.get(DELETE_MARKER_FACILITATOR_METADATA, "false").lower() == "true"
         or response_has_facilitator_metadata(response.get("ResponseMetadata", {}).get("HTTPHeaders", {}))
+    )
+
+def is_tag_facilitator_version(s3_client, bucket, key, version):
+    possible = (
+        version.get("Size") == len(TAG_FACILITATOR_BODY)
+        and version.get("ETag") == TAG_FACILITATOR_ETAG
+    )
+    if not possible:
+        return False
+
+    try:
+        response = s3_client.head_object(
+            Bucket=bucket,
+            Key=key,
+            VersionId=version.get("VersionId"),
+        )
+    except Exception as exc:
+        logging.info("Unable to inspect possible tag facilitator version %s/%s: %s", bucket, key, exc)
+        return False
+
+    metadata = response.get("Metadata", {})
+    return (
+        metadata.get(TAG_FACILITATOR_METADATA, "false").lower() == "true"
+        or response_has_tag_facilitator_metadata(response.get("ResponseMetadata", {}).get("HTTPHeaders", {}))
     )
 
 def is_invalid_list_prefix_error(exc) -> bool:
@@ -868,7 +993,10 @@ class VersionItemStream:
                 if (
                     self.skip_facilitators
                     and item_type == "Version"
-                    and is_facilitator_version(self.s3_client, self.bucket, original_key, item)
+                    and (
+                        is_facilitator_version(self.s3_client, self.bucket, original_key, item)
+                        or is_tag_facilitator_version(self.s3_client, self.bucket, original_key, item)
+                    )
                 ):
                     continue
 
@@ -1101,7 +1229,10 @@ class VersionedKeyStream:
                 if (
                     self.skip_facilitators
                     and item_type == "Version"
-                    and is_facilitator_version(self.s3_client, self.bucket, original_key, item)
+                    and (
+                        is_facilitator_version(self.s3_client, self.bucket, original_key, item)
+                        or is_tag_facilitator_version(self.s3_client, self.bucket, original_key, item)
+                    )
                 ):
                     continue
 
@@ -1539,6 +1670,9 @@ async def list_objects_handler(bucket: str, request: Request, prefix: str = ""):
     if encoding_error:
         return encoding_error
 
+    if query_has_param(request.url.query, "tagging"):
+        return not_implemented_response("Bucket tagging is not implemented")
+
     if query_has_param(request.url.query, "uploads"):
         list_uploads_prefix = params.get("prefix", prefix or "")
         max_uploads = int(params.get("max-uploads", "1000"))
@@ -1908,6 +2042,15 @@ async def proxy(full_path: str, request: Request):
 
     if has_header(original_headers, "x-amz-copy-source"):
         return not_implemented_response("CopyObject and UploadPartCopy are not implemented")
+
+    if query_has_param(query_string, "tagging"):
+        return await handle_object_tagging_request(
+            method,
+            full_path,
+            query_string,
+            original_headers,
+            body,
+        )
     
     # Special case: PUT with If-None-Match
     if (
@@ -1957,6 +2100,10 @@ async def proxy(full_path: str, request: Request):
     if method in {"GET", "HEAD"} and response_has_facilitator_metadata(response.headers):
         logging.info("Overlay response includes facilitator metadata; treating as delete marker (404)")
         response = httpx.Response(status_code=404, content=b"", headers=response.headers)
+
+    if method in {"GET", "HEAD"} and response_has_tag_facilitator_metadata(response.headers):
+        logging.info("Overlay response includes tag facilitator metadata; treating as overlay miss")
+        response = httpx.Response(status_code=404, content=b"", headers=response.headers)
     
     if not multipart_subresource:
         response = await handle_conditional_mutation(
@@ -1982,8 +2129,4 @@ async def proxy(full_path: str, request: Request):
     if multipart_subresource:
         response = rewrite_multipart_xml_response(response, full_path, request)
     
-    return Response(
-        content=response.content,
-        status_code=response.status_code,
-        headers={k: v for k, v in response.headers.items() if k.lower() not in {"content-encoding", "transfer-encoding"}}
-    )
+    return response_from_httpx(response)
