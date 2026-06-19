@@ -109,6 +109,12 @@ def test_rewrite_overlay_path_preserves_object_key_slashes(monkeypatch):
     assert main.rewrite_overlay_path("bucket/asdf/") == "overlay/bucket/asdf/"
 
 
+def test_overlay_header_forwarding_allows_only_sse_s3():
+    assert main.should_forward_overlay_header("x-amz-server-side-encryption")
+    assert not main.should_forward_overlay_header("x-amz-server-side-encryption-aws-kms-key-id")
+    assert not main.should_forward_overlay_header("x-amz-server-side-encryption-customer-key")
+
+
 def test_list_v2_max_keys_zero_avoids_s3_calls(monkeypatch):
     origin_client = FakeVersionClient([{"Versions": [version("a", 1)]}])
     overlay_client = FakeVersionClient([{"Versions": [version("bucket/b", 1)]}])

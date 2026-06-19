@@ -40,6 +40,7 @@ services:
     environment:
       MINIO_ACCESS_KEY: overlay-access
       MINIO_SECRET_KEY: overlay-secret
+      MINIO_KMS_SECRET_KEY: "sse-s3-test-key:vwY33RV2+4XYBEjcNkj0xUkg35TXJl7rWdbAOjQ3C0I="
       MINIO_STORAGE_CLASS_STANDARD: EC:0
       MINIO_DISK_USAGE_CRAWL: "off"
     tmpfs:

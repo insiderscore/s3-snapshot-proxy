@@ -248,6 +248,8 @@ def should_forward_overlay_header(name: str) -> bool:
         return False
     if lower_name.startswith("x-amz-meta-"):
         return True
+    if lower_name == "x-amz-server-side-encryption":
+        return True
     if lower_name.startswith("x-amz"):
         return False
     return True

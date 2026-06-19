@@ -119,3 +119,14 @@ Handling of multipart uploads:
 - CopyObject and UploadPartCopy are intentionally rejected with 501
   because they require source-object rewriting across the virtual
   bucket view.
+
+Handling of server-side encryption:
+
+- Explicit SSE-S3 object uploads are passed through to the overlay bucket by
+  forwarding `x-amz-server-side-encryption: AES256`. The overlay backend must
+  be configured to support SSE-S3.
+
+- Explicit KMS key selection and customer-provided encryption keys are not
+  currently forwarded. Default bucket encryption is expected to be transparent
+  when configured directly on origin or overlay buckets, but bucket encryption
+  administration is outside the proxy's support surface.
