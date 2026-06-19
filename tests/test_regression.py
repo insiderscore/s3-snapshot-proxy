@@ -61,6 +61,14 @@ def populate_overlay_via_proxy(proxy_client, bucket_names, origin_keys, num_new,
     
     return new_keys, overlaid_keys, deleted_keys
 
+def overlay_has_key_history(overlay_client, overlay_bucket, overlay_path):
+    paginator = overlay_client.get_paginator("list_object_versions")
+    for page in paginator.paginate(Bucket=overlay_bucket, Prefix=overlay_path):
+        for item in page.get("Versions", []) + page.get("DeleteMarkers", []):
+            if item.get("Key") == overlay_path:
+                return True
+    return False
+
 def find_pre_start_origin_object(origin_client, proxy_client, overlay_client, bucket, start_time, overlay_bucket):
     candidates = {}
     paginator = origin_client.get_paginator("list_object_versions")
@@ -1118,27 +1126,28 @@ def test_multiple_versions_before_start_time():
             if delete_markers and delete_markers[0]['LastModified'] > versions[0]['LastModified']:
                 continue
             
-            # Check if object exists in overlay
+            # Check if object has any overlay history, including delete markers.
             overlay_path = f"{bucket}/{key}"
-            try:
-                overlay_client = boto3.client(
-                    "s3",
-                    endpoint_url=health_data.get('overlayS3', "http://minio-overlay:9000"),
-                    aws_access_key_id="overlay-access",
-                    aws_secret_access_key="overlay-secret"
-                )
-                overlay_client.head_object(Bucket=health_data.get('overlayBucket', 'overlay'), Key=overlay_path)
-                # Exists in overlay, skip
+            overlay_client = boto3.client(
+                "s3",
+                endpoint_url=health_data.get('overlayS3', "http://minio-overlay:9000"),
+                aws_access_key_id="overlay-access",
+                aws_secret_access_key="overlay-secret"
+            )
+            if overlay_has_key_history(
+                overlay_client,
+                health_data.get('overlayBucket', 'overlay'),
+                overlay_path,
+            ):
                 continue
-            except Exception:
-                # Good candidate - doesn't exist in overlay
-                suitable_objects.append({
-                    'key': key,
-                    'versions': versions
-                })
-                print(f"Found object with {len(versions)} versions before START_TIME: {bucket}/{key}")
-                if len(suitable_objects) >= 3:  # Find a few candidates
-                    break
+
+            suitable_objects.append({
+                'key': key,
+                'versions': versions
+            })
+            print(f"Found object with {len(versions)} versions before START_TIME: {bucket}/{key}")
+            if len(suitable_objects) >= 3:  # Find a few candidates
+                break
     
     if not suitable_objects:
         pytest.skip("No objects with multiple pre-START_TIME versions found. Skipping test.")
