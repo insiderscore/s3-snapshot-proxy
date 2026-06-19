@@ -31,7 +31,10 @@ allowlist:
   the origin bucket return item-level failures because the proxy must never
   mutate origin bucket versions.
 - Object tagging and bucket tagging.
-- Server-side encryption and customer-provided encryption keys.
+- Bucket encryption administration, default bucket encryption behavior, explicit
+  SSE-KMS key selection, and customer-provided encryption keys. Explicit
+  SSE-S3 object uploads are supported when the overlay backend has KMS
+  configured.
 - S3 Select.
 - Object lock and retention.
 - Storage classes and transition/restore behavior.
