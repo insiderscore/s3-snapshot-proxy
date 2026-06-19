@@ -110,6 +110,7 @@ def test_rewrite_overlay_path_preserves_object_key_slashes(monkeypatch):
 
 
 def test_overlay_header_forwarding_allows_only_sse_s3():
+    assert main.should_forward_overlay_header("x-amz-tagging")
     assert main.should_forward_overlay_header("x-amz-server-side-encryption")
     assert not main.should_forward_overlay_header("x-amz-server-side-encryption-aws-kms-key-id")
     assert not main.should_forward_overlay_header("x-amz-server-side-encryption-customer-key")

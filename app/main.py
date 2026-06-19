@@ -248,6 +248,8 @@ def should_forward_overlay_header(name: str) -> bool:
         return False
     if lower_name.startswith("x-amz-meta-"):
         return True
+    if lower_name == "x-amz-tagging":
+        return True
     if lower_name == "x-amz-server-side-encryption":
         return True
     if lower_name.startswith("x-amz"):
@@ -1942,6 +1944,7 @@ async def proxy(full_path: str, request: Request):
     if (
         method == "DELETE"
         and not multipart_subresource
+        and not query_has_param(query_string, "tagging")
         and not query_has_param(query_string, "versionId")
     ):
         response = await handle_delete_request(overlay_url, overlay_headers, body)

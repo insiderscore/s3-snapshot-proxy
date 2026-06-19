@@ -130,3 +130,12 @@ Handling of server-side encryption:
   currently forwarded. Default bucket encryption is expected to be transparent
   when configured directly on origin or overlay buckets, but bucket encryption
   administration is outside the proxy's support surface.
+
+Handling of object tagging:
+
+- Object tagging operations are passed through to the overlay bucket for objects
+  that already exist in the overlay view. This includes tags supplied during
+  multipart upload initiation.
+
+- Tagging objects that exist only in the origin bucket is not handled by the
+  overlay-only pass-through path.
