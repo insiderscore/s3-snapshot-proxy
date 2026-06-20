@@ -1,4 +1,7 @@
+import base64
 import boto3
+import gzip
+import hashlib
 import random
 import string
 from tqdm import tqdm
@@ -10,6 +13,7 @@ import json
 import requests
 from datetime import datetime, timezone, timedelta
 import time
+import xml.etree.ElementTree as ET
 
 # Helper to generate random object keys with varying depth
 def random_key(prefix, size=10, max_depth=5):
@@ -114,14 +118,8 @@ def find_pre_start_origin_object(origin_client, proxy_client, overlay_client, bu
         newest_version = versions[0]
         overlay_path = f"{bucket}/{key}"
 
-        try:
-            overlay_client.head_object(Bucket=overlay_bucket, Key=overlay_path)
+        if overlay_has_key_history(overlay_client, overlay_bucket, overlay_path):
             continue
-        except botocore.exceptions.ClientError as e:
-            status_code = e.response.get("ResponseMetadata", {}).get("HTTPStatusCode")
-            error_code = e.response.get("Error", {}).get("Code")
-            if status_code != 404 and error_code not in {"404", "NoSuchKey", "NotFound"}:
-                raise
 
         try:
             proxy_client.head_object(Bucket=bucket, Key=key)
@@ -168,6 +166,61 @@ def tag_pairs(response):
         (tag["Key"], tag["Value"])
         for tag in response.get("TagSet", [])
     }
+
+def aws_chunked_body(payload):
+    midpoint = max(1, len(payload) // 2)
+    chunks = [payload[:midpoint], payload[midpoint:]]
+    encoded = b""
+    for chunk in chunks:
+        if not chunk:
+            continue
+        encoded += f"{len(chunk):x};chunk-signature={'0' * 64}\r\n".encode("ascii")
+        encoded += chunk + b"\r\n"
+    encoded += f"0;chunk-signature={'0' * 64}\r\n\r\n".encode("ascii")
+    return encoded
+
+def test_put_decodes_aws_chunked_content_encoding():
+    bucket = "origin-bucket1"
+    key = f"aws-chunked-put-{random.randint(1000, 9999)}"
+    body = gzip.compress(b"proxy should stream decoded request bodies without aws-chunked metadata")
+    encoded_body = aws_chunked_body(body)
+    content_md5 = base64.b64encode(hashlib.md5(body).digest()).decode("ascii")
+
+    put_response = requests.put(
+        f"http://s3proxy:9000/{bucket}/{key}",
+        data=encoded_body,
+        headers={
+            "Content-Encoding": "aws-chunked,gzip",
+            "Content-Length": str(len(encoded_body)),
+            "Content-MD5": content_md5,
+            "x-amz-content-sha256": "STREAMING-AWS4-HMAC-SHA256-PAYLOAD",
+            "x-amz-decoded-content-length": str(len(body)),
+        },
+    )
+    assert put_response.status_code == 200, put_response.text
+
+    response = requests.get(f"http://s3proxy:9000/{bucket}/{key}", stream=True)
+    assert response.status_code == 200
+    assert response.headers.get("Content-Encoding") == "gzip"
+    assert response.raw.read(decode_content=False) == body
+
+def test_bucket_root_trailing_slash_list_objects_v2_returns_xml():
+    bucket = "origin-bucket1"
+    response = requests.get(
+        f"http://s3proxy:9000/{bucket}/",
+        params={
+            "list-type": "2",
+            "prefix": "origin/",
+            "max-keys": "2",
+            "fetch-owner": "false",
+        },
+    )
+    assert response.status_code == 200, response.text
+
+    root = ET.fromstring(response.content)
+    assert root.tag == "ListBucketResult"
+    assert root.findtext("Name") == bucket
+    assert root.findtext("Prefix") == "origin/"
 
 # Test the proxy
 def test_proxy(scale_factor):
@@ -986,8 +1039,52 @@ def test_point_in_time_conditional():
     except botocore.exceptions.ClientError as e:
         pytest.fail(f"If-None-Match with 'after' ETag should succeed but failed: {e}")
     """
-    
+
     print("All point-in-time conditional tests passed!")
+
+def test_origin_delete_marker_after_start_preserves_snapshot_reads():
+    health_data = requests.get("http://s3proxy:9000/health").json()
+    start_time = datetime.fromisoformat(health_data["startTime"])
+    overlay_bucket = health_data.get("overlayBucket", "overlay")
+
+    origin_client = boto3.client(
+        "s3",
+        endpoint_url="http://minio-origin:9000",
+        aws_access_key_id="origin-access",
+        aws_secret_access_key="origin-secret"
+    )
+    overlay_client = boto3.client(
+        "s3",
+        endpoint_url=health_data.get("overlayS3", "http://minio-overlay:9000"),
+        aws_access_key_id="overlay-access",
+        aws_secret_access_key="overlay-secret"
+    )
+    proxy_client = boto3.client(
+        "s3",
+        endpoint_url="http://s3proxy:9000",
+        aws_access_key_id="origin-access",
+        aws_secret_access_key="origin-secret"
+    )
+
+    bucket = "origin-bucket1"
+    key, etag, _ = find_pre_start_origin_object(
+        origin_client,
+        proxy_client,
+        overlay_client,
+        bucket,
+        start_time,
+        overlay_bucket,
+    )
+    before_body = proxy_client.get_object(Bucket=bucket, Key=key)["Body"].read()
+
+    origin_client.delete_object(Bucket=bucket, Key=key)
+
+    head_response = proxy_client.head_object(Bucket=bucket, Key=key)
+    assert head_response["ETag"] == etag
+
+    get_response = proxy_client.get_object(Bucket=bucket, Key=key)
+    assert get_response["ETag"] == etag
+    assert get_response["Body"].read() == before_body
 
 def test_conditional_delete_operations():
     """Test conditional DELETE operations against objects in origin that don't exist in overlay"""
@@ -1312,15 +1409,14 @@ def test_list_objects_v2_with_delete_markers():
     for test_key in ["test-deleted-before-start/object1", "test-deleted-before-start/object2"]:
         # First check if there's a superseding version in overlay
         overlay_path = f"{bucket}/{test_key}"
-        has_overlay_version = False
-        try:
-            overlay_client.head_object(Bucket=overlay_bucket, Key=overlay_path)
-            has_overlay_version = True
+        has_overlay_version = overlay_has_key_history(
+            overlay_client,
+            overlay_bucket,
+            overlay_path,
+        )
+        if has_overlay_version:
             print(f"⚠️ Object {test_key} has a superseding version in overlay, skipping this test case")
-        except Exception:
-            # No overlay version, we can proceed with the test
-            pass
-            
+
         if not has_overlay_version:
             try:
                 proxy_client.head_object(Bucket=bucket, Key=test_key)
@@ -1336,15 +1432,14 @@ def test_list_objects_v2_with_delete_markers():
     for test_key in ["test-multi-version-deleted/object1", "test-multi-version-deleted/object2"]:
         # Check for overlay version first
         overlay_path = f"{bucket}/{test_key}"
-        has_overlay_version = False
-        try:
-            overlay_client.head_object(Bucket=overlay_bucket, Key=overlay_path)
-            has_overlay_version = True
+        has_overlay_version = overlay_has_key_history(
+            overlay_client,
+            overlay_bucket,
+            overlay_path,
+        )
+        if has_overlay_version:
             print(f"⚠️ Object {test_key} has a superseding version in overlay, skipping this test case")
-        except Exception:
-            # No overlay version, we can proceed with the test
-            pass
-            
+
         if not has_overlay_version:
             try:
                 proxy_client.head_object(Bucket=bucket, Key=test_key)
@@ -1378,15 +1473,14 @@ def test_list_objects_v2_with_delete_markers():
     for test_key in ["test-deleted-before-start/object1", "test-deleted-before-start/object2"]:
         # Check overlay first
         overlay_path = f"{bucket}/{test_key}"
-        has_overlay_version = False
-        try:
-            overlay_client.head_object(Bucket=overlay_bucket, Key=overlay_path)
-            has_overlay_version = True
+        has_overlay_version = overlay_has_key_history(
+            overlay_client,
+            overlay_bucket,
+            overlay_path,
+        )
+        if has_overlay_version:
             print(f"⚠️ Object {test_key} has a superseding version in overlay, skipping this assertion")
-        except Exception:
-            # No overlay version, we can proceed with the assertion
-            pass
-            
+
         if not has_overlay_version:
             assert test_key not in objects_returned, f"Deleted object {test_key} incorrectly appears in ListObjectsV2"
         
@@ -1409,15 +1503,14 @@ def test_list_objects_v2_with_delete_markers():
     for test_key in ["test-multi-version-deleted/object1", "test-multi-version-deleted/object2"]:
         # Check overlay first
         overlay_path = f"{bucket}/{test_key}"
-        has_overlay_version = False
-        try:
-            overlay_client.head_object(Bucket=overlay_bucket, Key=overlay_path)
-            has_overlay_version = True
+        has_overlay_version = overlay_has_key_history(
+            overlay_client,
+            overlay_bucket,
+            overlay_path,
+        )
+        if has_overlay_version:
             print(f"⚠️ Object {test_key} has a superseding version in overlay, skipping this assertion")
-        except Exception:
-            # No overlay version, we can proceed with the assertion
-            pass
-            
+
         if not has_overlay_version:
             assert test_key not in objects_returned, f"Multi-version deleted object {test_key} incorrectly appears in ListObjectsV2"
         
@@ -1471,18 +1564,14 @@ def test_list_objects_v2_with_delete_markers():
     for key, history in origin_keys_with_history.items():
         # Check if there's a superseding version in overlay
         overlay_path = f"{bucket}/{key}"
-        has_overlay_version = False
-        try:
-            overlay_client.head_object(Bucket=overlay_bucket, Key=overlay_path)
-            has_overlay_version = True
+        has_overlay_version = overlay_has_key_history(
+            overlay_client,
+            overlay_bucket,
+            overlay_path,
+        )
+        if has_overlay_version:
             # Skip objects that have been modified in overlay
             continue
-        except Exception:
-            # No overlay version, we can proceed with analyzing this object
-            pass
-            
-        if has_overlay_version:
-            continue  # Skip this key since it has been modified in overlay
         
         # Sort versions by LastModified time (newest first)
         history_before_start = [v for v in history if v['LastModified'] < start_time]
@@ -2020,8 +2109,8 @@ def test_list_multipart_uploads_via_proxy():
                 if exc.response.get("Error", {}).get("Code") != "NoSuchUpload":
                     raise
 
-def test_copy_object_is_explicitly_unsupported():
-    print("\n=== Testing Explicit CopyObject Rejection ===\n")
+def test_copy_object_overlay_source_via_proxy():
+    print("\n=== Testing Overlay CopyObject ===\n")
 
     proxy_client = boto3.client(
         "s3",
@@ -2029,11 +2118,90 @@ def test_copy_object_is_explicitly_unsupported():
         aws_access_key_id="origin-access",
         aws_secret_access_key="origin-secret"
     )
+    origin_client = boto3.client(
+        "s3",
+        endpoint_url="http://minio-origin:9000",
+        aws_access_key_id="origin-access",
+        aws_secret_access_key="origin-secret"
+    )
+    overlay_client = boto3.client(
+        "s3",
+        endpoint_url="http://minio-overlay:9000",
+        aws_access_key_id="overlay-access",
+        aws_secret_access_key="overlay-secret"
+    )
+
+    health_data = requests.get("http://s3proxy:9000/health").json()
+    overlay_bucket = health_data.get("overlayBucket", "overlay")
 
     bucket = "origin-bucket1"
-    source_key = f"copy-unsupported/source-{random.randint(1000, 9999)}"
+    source_key = f"copy-supported/source-{random.randint(1000, 9999)}"
+    dest_key = f"copy-supported/dest-{random.randint(1000, 9999)}"
+    body = b"copy source"
+    proxy_client.put_object(
+        Bucket=bucket,
+        Key=source_key,
+        Body=body,
+        Metadata={"copy-source": "overlay"},
+    )
+
+    response = proxy_client.copy_object(
+        Bucket=bucket,
+        Key=dest_key,
+        CopySource={"Bucket": bucket, "Key": source_key},
+    )
+    assert response["CopyObjectResult"]["ETag"]
+
+    copied = proxy_client.get_object(Bucket=bucket, Key=dest_key)
+    assert copied["Body"].read() == body
+    assert copied["Metadata"] == {"copy-source": "overlay"}
+
+    overlay_head = overlay_client.head_object(
+        Bucket=overlay_bucket,
+        Key=f"{bucket}/{dest_key}",
+    )
+    assert overlay_head["ContentLength"] == len(body)
+
+    with pytest.raises(botocore.exceptions.ClientError) as origin_head_error:
+        origin_client.head_object(Bucket=bucket, Key=dest_key)
+    assert origin_head_error.value.response.get("ResponseMetadata", {}).get("HTTPStatusCode") == 404
+
+def test_copy_object_origin_source_is_explicitly_unsupported():
+    print("\n=== Testing Origin CopyObject Rejection ===\n")
+
+    health_data = requests.get("http://s3proxy:9000/health").json()
+    start_time = datetime.fromisoformat(health_data["startTime"])
+    overlay_bucket = health_data.get("overlayBucket", "overlay")
+
+    origin_client = boto3.client(
+        "s3",
+        endpoint_url="http://minio-origin:9000",
+        aws_access_key_id="origin-access",
+        aws_secret_access_key="origin-secret"
+    )
+    proxy_client = boto3.client(
+        "s3",
+        endpoint_url="http://s3proxy:9000",
+        aws_access_key_id="origin-access",
+        aws_secret_access_key="origin-secret"
+    )
+    overlay_client = boto3.client(
+        "s3",
+        endpoint_url="http://minio-overlay:9000",
+        aws_access_key_id="overlay-access",
+        aws_secret_access_key="overlay-secret"
+    )
+
+    bucket = "origin-bucket1"
+    source_key, _, _ = find_pre_start_origin_object(
+        origin_client,
+        proxy_client,
+        overlay_client,
+        bucket,
+        start_time,
+        overlay_bucket,
+    )
     dest_key = f"copy-unsupported/dest-{random.randint(1000, 9999)}"
-    proxy_client.put_object(Bucket=bucket, Key=source_key, Body=b"copy source")
 
     with pytest.raises(botocore.exceptions.ClientError) as copy_error:
         proxy_client.copy_object(
