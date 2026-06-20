@@ -222,6 +222,48 @@ def test_bucket_root_trailing_slash_list_objects_v2_returns_xml():
     assert root.findtext("Name") == bucket
     assert root.findtext("Prefix") == "origin/"
 
+def test_conditional_put_failure_preserves_connection_state():
+    bucket = "origin-bucket1"
+    key = f"conditional-put-existing-{random.randint(1000, 9999)}"
+    url = f"http://s3proxy:9000/{bucket}/{key}"
+
+    with requests.Session() as session:
+        create_response = session.put(url, data=b"bar")
+        assert create_response.status_code == 200, create_response.text
+
+        failed_response = session.put(
+            url,
+            data=b"zar",
+            headers={"If-None-Match": "*"},
+        )
+        assert failed_response.status_code == 412, failed_response.text
+
+        get_response = session.get(url)
+        assert get_response.status_code == 200, get_response.text
+        assert get_response.content == b"bar"
+
+def test_conditional_put_if_match_star_missing_returns_not_found():
+    bucket = "origin-bucket1"
+    key = f"conditional-put-missing-{random.randint(1000, 9999)}"
+    url = f"http://s3proxy:9000/{bucket}/{key}"
+
+    put_response = requests.put(
+        url,
+        data=b"bar",
+        headers={"If-Match": "*"},
+    )
+    assert put_response.status_code == 404, put_response.text
+
+    proxy_client = boto3.client(
+        "s3",
+        endpoint_url="http://s3proxy:9000",
+        aws_access_key_id="origin-access",
+        aws_secret_access_key="origin-secret"
+    )
+    with pytest.raises(botocore.exceptions.ClientError) as head_error:
+        proxy_client.head_object(Bucket=bucket, Key=key)
+    assert head_error.value.response.get("ResponseMetadata", {}).get("HTTPStatusCode") == 404
+
 # Test the proxy
 def test_proxy(scale_factor):
     # Get the proxy's START_TIME from the health endpoint

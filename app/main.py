@@ -378,6 +378,24 @@ async def read_control_body(request: Request) -> bytes:
         chunks.append(chunk)
     return b"".join(chunks)
 
+async def finalize_early_body_response(request: Request, response: Response) -> Response:
+    length_header = get_header(request.headers, "content-length")
+    try:
+        content_length = int(length_header) if length_header is not None else None
+    except ValueError:
+        content_length = None
+
+    if content_length is None or content_length > MAX_CONTROL_BODY_BYTES:
+        response.headers["Connection"] = "close"
+        return response
+
+    try:
+        async for _ in request.stream():
+            pass
+    except Exception:
+        response.headers["Connection"] = "close"
+    return response
+
 def rewrite_overlay_path(original_path: str) -> str:
     bucket, key = split_bucket_key(original_path)
     if key:
@@ -2540,6 +2558,9 @@ async def prepare_streaming_put_conditions(
 
     origin_obj = check_object_at_start_time(bucket, key)
     if origin_obj is None:
+        etags = [tag.strip(' "') for tag in if_match.split(",")]
+        if "*" in etags:
+            return s3_error_response("NoSuchKey", "The specified key does not exist.", 404), overlay_headers
         return response_from_httpx(precondition_failed_response()), overlay_headers
 
     etags = [tag.strip(' "') for tag in if_match.split(",")]
@@ -2625,7 +2646,7 @@ async def proxy(full_path: str, request: Request):
         overlay_headers,
     )
     if conditional_response:
-        return conditional_response
+        return await finalize_early_body_response(request, conditional_response)
 
     overlay_body = None
     if method == "PUT":
@@ -2635,14 +2656,14 @@ async def proxy(full_path: str, request: Request):
             request_body_stream(request),
         )
         if body_error:
-            return body_error
+            return await finalize_early_body_response(request, body_error)
 
     if method == "PUT" and not has_header(overlay_headers, "content-length"):
-        return s3_error_response(
+        return await finalize_early_body_response(request, s3_error_response(
             "MissingContentLength",
             "You must provide the Content-Length HTTP header.",
             411,
-        )
+        ))
 
     if method == "PUT" and multipart_subresource and query_has_param(query_string, "uploadId"):
         logging.info("Sending streaming overlay request: %s %s", method, overlay_url)
