@@ -1,15 +1,23 @@
+import datetime as datetime_module
+import hmac
 import httpx
 from fastapi import FastAPI, Request, Response
+from fastapi.responses import StreamingResponse
 import os
 import argparse
-from urllib.parse import parse_qsl, quote
+from urllib.parse import parse_qsl, quote, unquote, urlsplit
 from httpx_auth import AWS4Auth
+from httpx_auth._aws import (
+    _signing_key,
+    _string_to_sign,
+    canonical_and_signed_headers,
+)
 import boto3
 from datetime import datetime, timezone
 import logging
 import sys
 import xml.etree.ElementTree as ET
-from typing import Optional
+from typing import AsyncIterator, Optional
 import botocore.exceptions
 import hashlib
 
@@ -52,6 +60,7 @@ LEGACY_DELETE_MARKER_FACILITATOR_ETAG = '"' + hashlib.md5(b"").hexdigest() + '"'
 TAG_FACILITATOR_METADATA = "s3-snapshot-proxy-tag-facilitator"
 TAG_FACILITATOR_BODY = b"s3-snapshot-proxy tag facilitator\n"
 TAG_FACILITATOR_ETAG = '"' + hashlib.md5(TAG_FACILITATOR_BODY).hexdigest() + '"'
+MAX_CONTROL_BODY_BYTES = int(os.environ.get("MAX_CONTROL_BODY_BYTES", str(10 * 1024 * 1024)))
 
 # Configurable base URLs
 OVERLAY_S3_URL = os.environ.get("OVERLAY_S3_URL", "http://overlay-s3.local")
@@ -163,8 +172,52 @@ else:
     # Fallback to the default boto3 session credentials.
     overlay_credentials = default_credentials
 
+class S3UnsignedPayloadAWS4Auth(AWS4Auth):
+    requires_request_body = False
+
+    def auth_flow(self, request):
+        date = datetime_module.datetime.now(datetime_module.timezone.utc)
+        request.headers["x-amz-date"] = date.strftime("%Y%m%dT%H%M%SZ")
+        payload_hash = request.headers.get("x-amz-content-sha256", "")
+        if not is_reusable_payload_hash(payload_hash):
+            payload_hash = "UNSIGNED-PAYLOAD"
+        request.headers["x-amz-content-sha256"] = payload_hash
+
+        if self.security_token:
+            request.headers["x-amz-security-token"] = self.security_token
+
+        canonical_headers, signed_headers = canonical_and_signed_headers(
+            request.headers,
+            self.include_headers,
+        )
+        canonical_request = self._canonical_request(
+            request,
+            canonical_headers,
+            signed_headers,
+        )
+        scope = f"{date.strftime('%Y%m%d')}/{self.region}/{self.service}/aws4_request"
+        string_to_sign = _string_to_sign(request, canonical_request, scope)
+        signing_key = _signing_key(
+            self.secret_key,
+            self.region,
+            self.service,
+            date.strftime("%Y%m%d"),
+        )
+        signature = hmac.new(
+            signing_key,
+            string_to_sign.encode("utf-8"),
+            hashlib.sha256,
+        ).hexdigest()
+
+        auth_str = "AWS4-HMAC-SHA256 "
+        auth_str += f"Credential={self.access_id}/{scope}, "
+        auth_str += f"SignedHeaders={signed_headers}, "
+        auth_str += f"Signature={signature}"
+        request.headers["Authorization"] = auth_str
+        yield request
+
 # Build AWS4Auth objects.
-origin_aws_auth = AWS4Auth(
+origin_aws_auth = S3UnsignedPayloadAWS4Auth(
     access_id=origin_credentials.access_key,
     secret_key=origin_credentials.secret_key,
     region=os.environ.get("AWS_REGION", "us-east-1"),
@@ -172,7 +225,7 @@ origin_aws_auth = AWS4Auth(
     security_token=origin_credentials.token
 )
 
-overlay_aws_auth = AWS4Auth(
+overlay_aws_auth = S3UnsignedPayloadAWS4Auth(
     access_id=overlay_credentials.access_key,
     secret_key=overlay_credentials.secret_key,
     region=os.environ.get("AWS_REGION", "us-east-1"),
@@ -185,6 +238,145 @@ client = httpx.AsyncClient(follow_redirects=True)
 
 # Signed client for overlay S3 using overlay_aws_auth
 signed_client = httpx.AsyncClient(auth=overlay_aws_auth, follow_redirects=True)
+
+async def forward_s3_request(
+    http_client: httpx.AsyncClient,
+    method: str,
+    url: str,
+    headers: Optional[dict] = None,
+    content: bytes = b"",
+    auth=None,
+) -> httpx.Response:
+    request = http_client.build_request(
+        method,
+        url,
+        headers=headers,
+        content=content,
+    )
+    send_kwargs = {"stream": True, "follow_redirects": True}
+    if auth is not None:
+        send_kwargs["auth"] = auth
+
+    response = await http_client.send(request, **send_kwargs)
+    try:
+        raw_content = b"".join([chunk async for chunk in response.aiter_raw()])
+    finally:
+        await response.aclose()
+
+    return httpx.Response(
+        status_code=response.status_code,
+        headers=response.headers,
+        content=raw_content,
+        request=response.request,
+    )
+
+async def open_s3_stream(
+    http_client: httpx.AsyncClient,
+    method: str,
+    url: str,
+    headers: Optional[dict] = None,
+    content=None,
+    auth=None,
+) -> httpx.Response:
+    request = http_client.build_request(
+        method,
+        url,
+        headers=headers,
+        content=content if content is not None else b"",
+    )
+    send_kwargs = {"stream": True, "follow_redirects": True}
+    if auth is not None:
+        send_kwargs["auth"] = auth
+    return await http_client.send(request, **send_kwargs)
+
+async def request_body_stream(request: Request) -> AsyncIterator[bytes]:
+    async for chunk in request.stream():
+        if chunk:
+            yield chunk
+
+class AWSChunkedBodyReader:
+    def __init__(self, source: AsyncIterator[bytes]):
+        self.source = source.__aiter__()
+        self.buffer = bytearray()
+        self.done = False
+
+    async def fill(self):
+        if self.done:
+            return
+        try:
+            chunk = await self.source.__anext__()
+        except StopAsyncIteration:
+            self.done = True
+            return
+        if chunk:
+            self.buffer.extend(chunk)
+
+    async def read_line(self, limit: int = 8192) -> bytes:
+        while True:
+            line_end = self.buffer.find(b"\r\n")
+            if line_end >= 0:
+                line = bytes(self.buffer[:line_end])
+                del self.buffer[:line_end + 2]
+                return line
+            if self.done:
+                raise AWSChunkedDecodeError("Malformed aws-chunked body: missing line terminator")
+            if len(self.buffer) > limit:
+                raise AWSChunkedDecodeError("Malformed aws-chunked body: chunk header too large")
+            await self.fill()
+
+    async def iter_exact(self, size: int) -> AsyncIterator[bytes]:
+        remaining = size
+        while remaining:
+            while not self.buffer and not self.done:
+                await self.fill()
+            if not self.buffer:
+                raise AWSChunkedDecodeError("Malformed aws-chunked body: truncated chunk data")
+            take = min(remaining, len(self.buffer))
+            data = bytes(self.buffer[:take])
+            del self.buffer[:take]
+            remaining -= take
+            yield data
+
+    async def read_exact_bytes(self, size: int) -> bytes:
+        return b"".join([chunk async for chunk in self.iter_exact(size)])
+
+async def aws_chunked_body_stream(source: AsyncIterator[bytes]) -> AsyncIterator[bytes]:
+    reader = AWSChunkedBodyReader(source)
+    while True:
+        line = await reader.read_line()
+        size_token = line.split(b";", 1)[0].strip()
+        try:
+            chunk_size = int(size_token, 16)
+        except ValueError as exc:
+            raise AWSChunkedDecodeError("Malformed aws-chunked body: invalid chunk size") from exc
+
+        if chunk_size == 0:
+            while True:
+                trailer_line = await reader.read_line()
+                if trailer_line == b"":
+                    return
+
+        async for data in reader.iter_exact(chunk_size):
+            yield data
+
+        if await reader.read_exact_bytes(2) != b"\r\n":
+            raise AWSChunkedDecodeError("Malformed aws-chunked body: missing chunk terminator")
+
+class ControlBodyTooLarge(Exception):
+    pass
+
+class AWSChunkedDecodeError(Exception):
+    pass
+
+async def read_control_body(request: Request) -> bytes:
+    chunks = []
+    total = 0
+    async for chunk in request.stream():
+        total += len(chunk)
+        if total > MAX_CONTROL_BODY_BYTES:
+            raise ControlBodyTooLarge()
+        chunks.append(chunk)
+    return b"".join(chunks)
 
 def rewrite_overlay_path(original_path: str) -> str:
     bucket, key = split_bucket_key(original_path)
@@ -221,6 +413,30 @@ def has_header(headers: dict, name: str) -> bool:
     target = name.lower()
     return any(key.lower() == target for key in headers)
 
+def set_header(headers: dict, name: str, value: str):
+    target = name.lower()
+    for key in list(headers):
+        if key.lower() == target:
+            headers.pop(key, None)
+    headers[name] = value
+
+def is_reusable_payload_hash(value: str) -> bool:
+    normalized = value.strip()
+    if normalized == "UNSIGNED-PAYLOAD":
+        return True
+    return len(normalized) == 64 and all(ch in "0123456789abcdefABCDEF" for ch in normalized)
+
+def content_encoding_values(headers: dict) -> list[str]:
+    value = get_header(headers, "content-encoding") or ""
+    return [item.strip().lower() for item in value.split(",") if item.strip()]
+
+def request_uses_aws_chunked_payload(headers: dict) -> bool:
+    payload_hash = (get_header(headers, "x-amz-content-sha256") or "").strip()
+    return (
+        "aws-chunked" in content_encoding_values(headers)
+        or payload_hash.startswith("STREAMING-AWS4-")
+    )
+
 def precondition_failed_response() -> httpx.Response:
     return httpx.Response(
         status_code=412,
@@ -245,11 +461,14 @@ def s3_error_response(code: str, message: str, status_code: int) -> Response:
         headers={"Content-Type": "application/xml"},
     )
 
-def filtered_response_headers(headers) -> dict:
+def filtered_response_headers(headers, preserve_content_length: bool = False) -> dict:
+    excluded = {"connection", "transfer-encoding"}
+    if not preserve_content_length:
+        excluded.add("content-length")
     return {
         k: v
         for k, v in headers.items()
-        if k.lower() not in {"content-encoding", "transfer-encoding"}
+        if k.lower() not in excluded
     }
 
 def response_from_httpx(response: httpx.Response) -> Response:
@@ -259,19 +478,164 @@ def response_from_httpx(response: httpx.Response) -> Response:
         headers=filtered_response_headers(response.headers),
     )
 
-def should_forward_overlay_header(name: str) -> bool:
+def streaming_response_from_httpx(response: httpx.Response) -> StreamingResponse:
+    if (
+        not isinstance(response.stream, httpx.AsyncByteStream)
+        or getattr(response, "is_stream_consumed", False)
+    ):
+        return response_from_httpx(response)
+
+    async def body_iter():
+        try:
+            async for chunk in response.aiter_raw():
+                yield chunk
+        finally:
+            await response.aclose()
+
+    return StreamingResponse(
+        body_iter(),
+        status_code=response.status_code,
+        headers=filtered_response_headers(response.headers, preserve_content_length=True),
+    )
+
+def overlay_header_value(name: str, value: str, preserve_content_length: bool = False) -> Optional[str]:
     lower_name = name.lower()
+    if lower_name in {"connection", "host", "transfer-encoding"}:
+        return None
+    if lower_name == "content-length" and not preserve_content_length:
+        return None
+    if lower_name == "content-encoding":
+        encodings = [
+            item.strip()
+            for item in value.split(",")
+            if item.strip() and item.strip().lower() != "aws-chunked"
+        ]
+        if not encodings:
+            return None
+        return ", ".join(encodings)
     if lower_name.startswith("authorization"):
-        return False
+        return None
     if lower_name.startswith("x-amz-meta-"):
-        return True
+        return value
     if lower_name == "x-amz-tagging":
-        return True
+        return value
     if lower_name == "x-amz-server-side-encryption":
-        return True
+        return value
+    if lower_name == "x-amz-content-sha256" and is_reusable_payload_hash(value):
+        return value
     if lower_name.startswith("x-amz"):
-        return False
-    return True
+        return None
+    return value
+
+def prepare_overlay_headers(headers: dict, preserve_content_length: bool = False) -> dict:
+    result = {}
+    for key, value in headers.items():
+        forwarded_value = overlay_header_value(
+            key,
+            value,
+            preserve_content_length=preserve_content_length,
+        )
+        if forwarded_value is not None:
+            result[key] = forwarded_value
+    return result
+
+def remove_body_integrity_headers(headers: dict):
+    for key in list(headers):
+        lower_key = key.lower()
+        if (
+            lower_key == "content-md5"
+            or lower_key == "x-amz-content-sha256"
+            or lower_key == "x-amz-sdk-checksum-algorithm"
+            or lower_key.startswith("x-amz-checksum-")
+        ):
+            headers.pop(key, None)
+
+def prepare_overlay_body_stream(
+    original_headers: dict,
+    overlay_headers: dict,
+    body_stream: AsyncIterator[bytes],
+) -> tuple[Optional[AsyncIterator[bytes]], Optional[Response]]:
+    if not request_uses_aws_chunked_payload(original_headers):
+        return body_stream, None
+
+    decoded_content_length = get_header(original_headers, "x-amz-decoded-content-length")
+    if not decoded_content_length or not decoded_content_length.strip().isdigit():
+        return None, s3_error_response(
+            "MissingContentLength",
+            "aws-chunked uploads require x-amz-decoded-content-length.",
+            411,
+        )
+
+    set_header(overlay_headers, "Content-Length", decoded_content_length.strip())
+    return aws_chunked_body_stream(body_stream), None
+
+def parse_copy_source(value: str) -> tuple[Optional[str], Optional[str], str]:
+    source = value.strip()
+    query = ""
+    if source.startswith("http://") or source.startswith("https://"):
+        parsed = urlsplit(source)
+        source = parsed.path
+        query = parsed.query
+    elif "?" in source:
+        source, query = source.split("?", 1)
+
+    source = unquote(source.lstrip("/"))
+    if "/" not in source:
+        return None, None, query
+
+    bucket, key = source.split("/", 1)
+    if not bucket or not key:
+        return None, None, query
+    return bucket, key, query
+
+def copy_source_has_version_id(query: str) -> bool:
+    return any(name.lower() == "versionid" for name, _ in parse_qsl(query, keep_blank_values=True))
+
+def copy_source_header_value(bucket: str, key: str) -> str:
+    overlay_source = f"{bucket}/{key}"
+    return f"/{quote(OVERLAY_BUCKET, safe='')}/{quote(overlay_source, safe='/')}"
+
+async def handle_copy_object_request(
+    full_path: str,
+    query_string: str,
+    original_headers: dict,
+    overlay_url: str,
+) -> Response:
+    copy_source = get_header(original_headers, "x-amz-copy-source")
+    if not copy_source:
+        return not_implemented_response("CopyObject requires x-amz-copy-source")
+
+    source_bucket, source_key, source_query = parse_copy_source(copy_source)
+    if source_bucket is None or source_key is None:
+        return s3_error_response("InvalidArgument", "Invalid x-amz-copy-source header.", 400)
+    if copy_source_has_version_id(source_query):
+        return not_implemented_response("Versioned CopyObject sources are not implemented")
+
+    source_overlay_path = f"{source_bucket}/{source_key}"
+    source_overlay_url = f"{OVERLAY_S3_URL}/{quote(OVERLAY_BUCKET, safe='')}/{quote(source_overlay_path, safe='/')}"
+    source_head = await forward_s3_request(signed_client, "HEAD", source_overlay_url)
+    if (
+        source_head.status_code == 404
+        or (get_header(source_head.headers, "x-amz-delete-marker") or "").lower() == "true"
+        or response_has_facilitator_metadata(source_head.headers)
+        or response_has_tag_facilitator_metadata(source_head.headers)
+    ):
+        return not_implemented_response("CopyObject from origin-backed objects is not implemented")
+    if source_head.status_code >= 400:
+        return response_from_httpx(source_head)
+
+    copy_headers = prepare_overlay_headers(original_headers, preserve_content_length=False)
+    remove_body_integrity_headers(copy_headers)
+    set_header(copy_headers, "x-amz-copy-source", copy_source_header_value(source_bucket, source_key))
+
+    response = await forward_s3_request(
+        signed_client,
+        "PUT",
+        overlay_url,
+        headers=copy_headers,
+        content=b"",
+    )
+    return response_from_httpx(response)
 
 def virtual_object_location(request: Request, bucket: str, key: str) -> str:
     quoted_bucket = quote(bucket, safe="")
@@ -341,9 +705,12 @@ async def handle_delete_request(overlay_url: str, overlay_headers: dict, body: b
     facilitator_headers = overlay_headers.copy()
     facilitator_headers.pop("content-length", None)
     facilitator_headers.pop("Content-Length", None)
+    remove_body_integrity_headers(facilitator_headers)
     facilitator_headers[f"x-amz-meta-{DELETE_MARKER_FACILITATOR_METADATA}"] = "true"
     logging.info("Creating facilitator object for deletion marker compatibility: PUT %s", overlay_url)
-    facilitator_response = await signed_client.put(
+    facilitator_response = await forward_s3_request(
+        signed_client,
+        "PUT",
         overlay_url,
         headers=facilitator_headers,
         content=DELETE_MARKER_FACILITATOR_BODY,
@@ -353,7 +720,7 @@ async def handle_delete_request(overlay_url: str, overlay_headers: dict, body: b
         return facilitator_response
 
     logging.info("Deleting facilitator object: DELETE %s", overlay_url)
-    response = await signed_client.request("DELETE", overlay_url, headers=overlay_headers, content=body)
+    response = await forward_s3_request(signed_client, "DELETE", overlay_url, headers=overlay_headers, content=body)
     logging.info("Delete response status: %s, headers: %s", response.status_code, dict(response.headers))
     return response
 
@@ -383,7 +750,9 @@ async def create_tag_facilitator_object(overlay_object_url: str) -> httpx.Respon
         f"x-amz-meta-{TAG_FACILITATOR_METADATA}": "true",
     }
     logging.info("Creating tag facilitator object: PUT %s", overlay_object_url)
-    return await signed_client.put(
+    return await forward_s3_request(
+        signed_client,
+        "PUT",
         overlay_object_url,
         headers=headers,
         content=TAG_FACILITATOR_BODY,
@@ -400,15 +769,15 @@ async def handle_object_tagging_request(
     if not key:
         return not_implemented_response("Bucket tagging is not implemented")
 
-    overlay_headers = {
-        k: v for k, v in original_headers.items()
-        if should_forward_overlay_header(k)
-    }
+    overlay_headers = prepare_overlay_headers(
+        original_headers,
+        preserve_content_length=method == "PUT",
+    )
     overlay_path = rewrite_overlay_path(full_path)
     overlay_object_url = f"{OVERLAY_S3_URL}/{quote(overlay_path)}"
     overlay_url = append_query(overlay_object_url, query_string)
 
-    response = await signed_client.request(method, overlay_url, headers=overlay_headers, content=body)
+    response = await forward_s3_request(signed_client, method, overlay_url, headers=overlay_headers, content=body)
     if response.status_code != 404 or query_has_param(query_string, "versionId"):
         return response_from_httpx(response)
 
@@ -434,7 +803,7 @@ async def handle_object_tagging_request(
     if facilitator_response.status_code >= 400:
         return response_from_httpx(facilitator_response)
 
-    response = await signed_client.request(method, overlay_url, headers=overlay_headers, content=body)
+    response = await forward_s3_request(signed_client, method, overlay_url, headers=overlay_headers, content=body)
     return response_from_httpx(response)
 
 def xml_local_name(tag: str) -> str:
@@ -706,8 +1075,8 @@ async def handle_precondition_failure(
         # No existing query params, use ?
         origin_url = f"{ORIGIN_S3_URL}/{bucket}/{quote(key)}?{version_param}"
     
-    new_response = await client.request(
-        method, origin_url, headers=original_headers, auth=origin_aws_auth, content=body
+    new_response = await forward_s3_request(
+        client, method, origin_url, headers=original_headers, auth=origin_aws_auth, content=body
     )
     return new_response
 
@@ -745,7 +1114,7 @@ async def handle_get_head_fallback(
             # It's not clear if we need to re-sign this request or not.
             # In my testing, the aws s3 client library did not include
             # If-Unmodified-Since in the signed headers. 
-            new_response = await client.request(method, origin_url, headers=origin_headers, content=body)
+            new_response = await forward_s3_request(client, method, origin_url, headers=origin_headers, content=body)
             logging.info("Origin response status: %s", new_response.status_code)
             if new_response.status_code == 412:
                 new_response = await handle_precondition_failure(
@@ -758,6 +1127,100 @@ async def handle_get_head_fallback(
                 )
             return new_response
     return response
+
+async def open_precondition_version_stream(
+    method: str,
+    full_path: str,
+    query_string: str,
+    original_headers: dict,
+) -> httpx.Response:
+    bucket, key = split_bucket_key(full_path)
+    if query_has_param(query_string, "versionId"):
+        return httpx.Response(status_code=412, content=b"")
+
+    logging.info("Received 412. Checking object state at START_TIME for: %s, key: %s", bucket, key)
+    origin_obj = check_object_at_start_time(bucket, key)
+    if origin_obj is None:
+        logging.info("No matching version found for key %s before START_TIME. Returning 404.", key)
+        return httpx.Response(status_code=404, content=b"")
+
+    version_id = origin_obj.get("VersionId")
+    logging.info("Found version %s. Retrying origin request with version subresource.", version_id)
+    version_param = f"versionId={version_id}"
+    if query_string:
+        origin_url = f"{ORIGIN_S3_URL}/{bucket}/{quote(key)}?{query_string}&{version_param}"
+    else:
+        origin_url = f"{ORIGIN_S3_URL}/{bucket}/{quote(key)}?{version_param}"
+
+    return await open_s3_stream(
+        client,
+        method,
+        origin_url,
+        headers=original_headers,
+        auth=origin_aws_auth,
+    )
+
+async def open_get_head_response(
+    method: str,
+    full_path: str,
+    query_string: str,
+    original_headers: dict,
+    overlay_url: str,
+    overlay_headers: dict,
+) -> httpx.Response:
+    logging.info("Sending overlay request: %s %s", method, overlay_url)
+    response = await open_s3_stream(
+        signed_client,
+        method,
+        overlay_url,
+        headers=overlay_headers,
+    )
+    logging.info("Overlay response status: %s, headers: %s", response.status_code, dict(response.headers))
+
+    overlay_miss = response.status_code == 404
+    if response_has_facilitator_metadata(response.headers):
+        logging.info("Overlay response includes facilitator metadata; treating as delete marker (404)")
+        overlay_miss = True
+    if response_has_tag_facilitator_metadata(response.headers):
+        logging.info("Overlay response includes tag facilitator metadata; treating as overlay miss")
+        overlay_miss = True
+
+    if not overlay_miss or response.headers.get("x-amz-delete-marker", "false").lower() == "true":
+        return response
+
+    await response.aclose()
+    origin_url = append_query(f"{ORIGIN_S3_URL}/{quote(full_path)}", query_string)
+    origin_headers = original_headers.copy()
+
+    proxy_start_str = START_TIME.strftime("%a, %d %b %Y %H:%M:%S GMT")
+    existing_ius = origin_headers.get("if-unmodified-since")
+    if not existing_ius:
+        origin_headers["If-Unmodified-Since"] = proxy_start_str
+    else:
+        try:
+            parsed_ius = datetime.strptime(existing_ius, "%a, %d %b %Y %H:%M:%S GMT").replace(tzinfo=timezone.utc)
+            if parsed_ius > START_TIME:
+                origin_headers["If-Unmodified-Since"] = proxy_start_str
+        except ValueError:
+            origin_headers["If-Unmodified-Since"] = proxy_start_str
+
+    logging.info("Fallback to origin S3: %s %s", method, origin_url)
+    origin_response = await open_s3_stream(client, method, origin_url, headers=origin_headers)
+    logging.info("Origin response status: %s", origin_response.status_code)
+    origin_current_delete_marker = (
+        origin_response.status_code == 404
+        and (get_header(origin_response.headers, "x-amz-delete-marker") or "").lower() == "true"
+    )
+    if origin_response.status_code == 412 or origin_current_delete_marker:
+        await origin_response.aclose()
+        return await open_precondition_version_stream(
+            method,
+            full_path,
+            query_string,
+            original_headers,
+        )
+
+    return origin_response
 
 def merged_list_to_xml(merged_list, bucket, prefix):
     """
@@ -1651,6 +2114,7 @@ def process_list_multipart_uploads(bucket, prefix, delimiter, key_marker, upload
     return ET.tostring(root, encoding="utf-8", method="xml")
 
 @app.get("/{bucket}")
+@app.get("/{bucket}/")
 async def list_objects_handler(bucket: str, request: Request, prefix: str = ""):
     """
     Dispatch S3 list requests based on query parameters.
@@ -1865,7 +2329,8 @@ async def handle_conditional_mutation(
             overlay_path = rewrite_overlay_path(full_path)
             overlay_url = append_query(f"{OVERLAY_S3_URL}/{quote(overlay_path)}", query_string)
             
-            new_response = await signed_client.request(
+            new_response = await forward_s3_request(
+                signed_client,
                 method, overlay_url, headers=modified_headers, content=body
             )
             
@@ -2028,22 +2493,96 @@ async def handle_if_none_match_star_put(
     # All checks passed, proceed with regular request flow
     return None
 
+async def prepare_streaming_put_conditions(
+    method: str,
+    full_path: str,
+    query_string: str,
+    original_headers: dict,
+    overlay_headers: dict,
+) -> tuple[Optional[Response], dict]:
+    if method != "PUT" or is_multipart_upload_subresource(query_string):
+        return None, overlay_headers
+
+    if_none_match = get_header(original_headers, "if-none-match")
+    if if_none_match:
+        if if_none_match != "*":
+            logging.info(f"Unsupported If-None-Match value for PUT: {if_none_match}")
+            return Response(
+                content=b"<Error><Code>NotImplemented</Code><Message>The If-None-Match header is only supported with value * for PUT operations</Message></Error>",
+                status_code=501,
+                headers={"Content-Type": "application/xml"}
+            ), overlay_headers
+
+        special_response = await handle_if_none_match_star_put(full_path, original_headers)
+        if special_response:
+            return special_response, overlay_headers
+
+    if_match = get_header(original_headers, "if-match")
+    if not if_match:
+        return None, overlay_headers
+
+    bucket, key = split_bucket_key(full_path)
+    overlay_path = f"{bucket}/{key}"
+    s3_client_overlay = get_overlay_s3_client()
+
+    try:
+        s3_client_overlay.head_object(Bucket=OVERLAY_BUCKET, Key=overlay_path)
+        return None, overlay_headers
+    except botocore.exceptions.ClientError as exc:
+        error_code = exc.response.get("Error", {}).get("Code")
+        status_code = exc.response.get("ResponseMetadata", {}).get("HTTPStatusCode")
+        if status_code != 404 and error_code not in {"404", "NoSuchKey", "NotFound"}:
+            return Response(
+                content=str(exc).encode("utf-8"),
+                status_code=status_code or 500,
+                headers={"Content-Type": "text/plain"},
+            ), overlay_headers
+
+    origin_obj = check_object_at_start_time(bucket, key)
+    if origin_obj is None:
+        return response_from_httpx(precondition_failed_response()), overlay_headers
+
+    etags = [tag.strip(' "') for tag in if_match.split(",")]
+    origin_etag = origin_obj.get("ETag", "").strip('"')
+    if origin_etag not in etags and "*" not in etags:
+        logging.info(f"If-Match condition not satisfied: {if_match} vs origin ETag {origin_etag}")
+        return response_from_httpx(precondition_failed_response()), overlay_headers
+
+    modified_headers = {
+        k: v for k, v in overlay_headers.items()
+        if k.lower() not in {"if-match", "if-none-match"}
+    }
+    modified_headers["If-None-Match"] = "*"
+    return None, modified_headers
+
 @app.api_route("/{full_path:path}", methods=["GET", "PUT", "DELETE", "HEAD", "POST"])
 async def proxy(full_path: str, request: Request):
     method = request.method
     query_string = request.url.query
     original_headers = dict(request.headers)
-    body = await request.body()
     multipart_subresource = is_multipart_upload_subresource(query_string)
     logging.info("Received %s request for %s", method, full_path)
 
     if method == "POST" and query_has_param(query_string, "delete"):
+        try:
+            body = await read_control_body(request)
+        except ControlBodyTooLarge:
+            return s3_error_response(
+                "EntityTooLarge",
+                "Control-plane request body exceeds the proxy limit",
+                413,
+            )
         return await handle_multi_object_delete_request(full_path, body)
 
-    if has_header(original_headers, "x-amz-copy-source"):
-        return not_implemented_response("CopyObject and UploadPartCopy are not implemented")
-
     if query_has_param(query_string, "tagging"):
+        try:
+            body = await read_control_body(request)
+        except ControlBodyTooLarge:
+            return s3_error_response(
+                "EntityTooLarge",
+                "Control-plane request body exceeds the proxy limit",
+                413,
+            )
         return await handle_object_tagging_request(
             method,
             full_path,
@@ -2051,82 +2590,111 @@ async def proxy(full_path: str, request: Request):
             original_headers,
             body,
         )
-    
-    # Special case: PUT with If-None-Match
-    if (
-        method == "PUT"
-        and not multipart_subresource
-        and "if-none-match" in {k.lower() for k in original_headers.keys()}
-    ):
-        if_none_match = get_header(original_headers, "if-none-match")
-        
-        # Only If-None-Match: * is allowed for PUT, return 501 for any other value
-        if if_none_match != "*":
-            logging.info(f"Unsupported If-None-Match value for PUT: {if_none_match}")
-            return Response(
-                content=b"<Error><Code>NotImplemented</Code><Message>The If-None-Match header is only supported with value * for PUT operations</Message></Error>",
-                status_code=501,
-                headers={"Content-Type": "application/xml"}
-            )
-            
-        # Special handling for If-None-Match: *
-        # Pre-emptively check both overlay and origin before proceeding
-        special_response = await handle_if_none_match_star_put(full_path, original_headers)
-        if special_response:
-            return special_response
-    
+
     # Use filtered headers for overlay S3 request.
-    overlay_headers = {
-        k: v for k, v in original_headers.items() 
-        if should_forward_overlay_header(k)
-    }
+    overlay_headers = prepare_overlay_headers(
+        original_headers,
+        preserve_content_length=method == "PUT",
+    )
     overlay_path = rewrite_overlay_path(full_path)
     overlay_url = append_query(f"{OVERLAY_S3_URL}/{quote(overlay_path)}", query_string)
+
+    if has_header(original_headers, "x-amz-copy-source"):
+        if multipart_subresource:
+            return not_implemented_response("UploadPartCopy is not implemented")
+        if method != "PUT":
+            return s3_error_response("InvalidRequest", "CopyObject requires PUT.", 400)
+        return await handle_copy_object_request(full_path, query_string, original_headers, overlay_url)
+
+    if method in {"GET", "HEAD"} and not multipart_subresource:
+        response = await open_get_head_response(
+            method,
+            full_path,
+            query_string,
+            original_headers,
+            overlay_url,
+            overlay_headers,
+        )
+        return streaming_response_from_httpx(response)
+
+    conditional_response, overlay_headers = await prepare_streaming_put_conditions(
+        method,
+        full_path,
+        query_string,
+        original_headers,
+        overlay_headers,
+    )
+    if conditional_response:
+        return conditional_response
+
+    overlay_body = None
+    if method == "PUT":
+        overlay_body, body_error = prepare_overlay_body_stream(
+            original_headers,
+            overlay_headers,
+            request_body_stream(request),
+        )
+        if body_error:
+            return body_error
+
+    if method == "PUT" and not has_header(overlay_headers, "content-length"):
+        return s3_error_response(
+            "MissingContentLength",
+            "You must provide the Content-Length HTTP header.",
+            411,
+        )
+
+    if method == "PUT" and multipart_subresource and query_has_param(query_string, "uploadId"):
+        logging.info("Sending streaming overlay request: %s %s", method, overlay_url)
+        try:
+            response = await open_s3_stream(
+                signed_client,
+                method,
+                overlay_url,
+                headers=overlay_headers,
+                content=overlay_body,
+            )
+        except AWSChunkedDecodeError as exc:
+            return s3_error_response("InvalidRequest", str(exc), 400)
+        logging.info("Overlay response status: %s, headers: %s", response.status_code, dict(response.headers))
+        return streaming_response_from_httpx(response)
+
+    if multipart_subresource:
+        try:
+            body = await read_control_body(request)
+        except ControlBodyTooLarge:
+            return s3_error_response(
+                "EntityTooLarge",
+                "Control-plane request body exceeds the proxy limit",
+                413,
+            )
+
+        logging.info("Sending overlay request: %s %s", method, overlay_url)
+        response = await forward_s3_request(signed_client, method, overlay_url, headers=overlay_headers, content=body)
+        logging.info("Overlay response status: %s, headers: %s", response.status_code, dict(response.headers))
+        response = rewrite_multipart_xml_response(response, full_path, request)
+        return response_from_httpx(response)
     
     # Forward request to overlay
     if (
         method == "DELETE"
-        and not multipart_subresource
         and not query_has_param(query_string, "tagging")
         and not query_has_param(query_string, "versionId")
     ):
-        response = await handle_delete_request(overlay_url, overlay_headers, body)
+        response = await handle_delete_request(overlay_url, overlay_headers, b"")
+        return response_from_httpx(response)
     else:
-        logging.info("Sending overlay request: %s %s", method, overlay_url)
-        response = await signed_client.request(method, overlay_url, headers=overlay_headers, content=body)
+        content = overlay_body if method == "PUT" else request_body_stream(request) if method == "POST" else b""
+        logging.info("Sending streaming overlay request: %s %s", method, overlay_url)
+        try:
+            response = await open_s3_stream(
+                signed_client,
+                method,
+                overlay_url,
+                headers=overlay_headers,
+                content=content,
+            )
+        except AWSChunkedDecodeError as exc:
+            return s3_error_response("InvalidRequest", str(exc), 400)
         logging.info("Overlay response status: %s, headers: %s", response.status_code, dict(response.headers))
-    
-    # For GET/HEAD, if the overlay response includes facilitator metadata, treat it as delete marker.
-    if method in {"GET", "HEAD"} and response_has_facilitator_metadata(response.headers):
-        logging.info("Overlay response includes facilitator metadata; treating as delete marker (404)")
-        response = httpx.Response(status_code=404, content=b"", headers=response.headers)
-
-    if method in {"GET", "HEAD"} and response_has_tag_facilitator_metadata(response.headers):
-        logging.info("Overlay response includes tag facilitator metadata; treating as overlay miss")
-        response = httpx.Response(status_code=404, content=b"", headers=response.headers)
-    
-    if not multipart_subresource:
-        response = await handle_conditional_mutation(
-            method,
-            full_path,
-            query_string,
-            original_headers,
-            body,
-            response,
-        )
-    
-    # Fallback to origin S3 for GET/HEAD if needed
-    if method in {"GET", "HEAD"} and not multipart_subresource:
-        response = await handle_get_head_fallback(
-            method,
-            full_path,
-            query_string,
-            original_headers,
-            body,
-            response,
-        )
-
-    if multipart_subresource:
-        response = rewrite_multipart_xml_response(response, full_path, request)
-    
-    return response_from_httpx(response)
+        return streaming_response_from_httpx(response)
