@@ -283,6 +283,40 @@ def test_list_v2_delimiter_coalesces_common_prefixes(monkeypatch):
     assert next_token == ""
 
 
+def test_list_v2_delimiter_uses_backend_common_prefixes(monkeypatch):
+    origin_client = FakeVersionClient([
+        {
+            "CommonPrefixes": [
+                {"Prefix": "1996/01/"},
+                {"Prefix": "1996/02/"},
+            ],
+            "IsTruncated": False,
+        }
+    ])
+    overlay_client = FakeVersionClient([
+        {"CommonPrefixes": [{"Prefix": "bucket/1996/03/"}], "IsTruncated": False}
+    ])
+    wire_clients(monkeypatch, origin_client, overlay_client)
+
+    entries, is_truncated, next_token = main.collect_list_objects_v2_page(
+        "bucket", "1996/", "/", 10, None
+    )
+
+    assert [(entry["Type"], entry["Name"]) for entry in entries] == [
+        ("CommonPrefix", "1996/01/"),
+        ("CommonPrefix", "1996/02/"),
+        ("CommonPrefix", "1996/03/"),
+    ]
+    assert is_truncated is False
+    assert next_token == ""
+    assert len(origin_client.calls) == 1
+    assert origin_client.calls[0]["Prefix"] == "1996/"
+    assert origin_client.calls[0]["Delimiter"] == "/"
+    assert len(overlay_client.calls) == 1
+    assert overlay_client.calls[0]["Prefix"] == "bucket/1996/"
+    assert overlay_client.calls[0]["Delimiter"] == "/"
+
+
 def test_list_v2_treats_invalid_overlay_prefix_as_empty(monkeypatch):
     origin_client = FakeVersionClient([{"Versions": []}])
     overlay_client = FakeVersionClient([invalid_object_name_error()])
@@ -384,6 +418,32 @@ def test_list_versions_small_page_uses_first_origin_page_only(monkeypatch):
     assert next_version_id_marker == "version-a-1"
     assert len(origin_client.calls) == 1
     assert len(overlay_client.calls) == 1
+
+
+def test_list_versions_delimiter_uses_backend_common_prefixes(monkeypatch):
+    origin_client = FakeVersionClient([
+        {"CommonPrefixes": [{"Prefix": "1996/01/"}], "IsTruncated": False}
+    ])
+    overlay_client = FakeVersionClient([
+        {"CommonPrefixes": [{"Prefix": "bucket/1996/02/"}], "IsTruncated": False}
+    ])
+    wire_clients(monkeypatch, origin_client, overlay_client)
+
+    entries, is_truncated, next_key_marker, next_version_id_marker = (
+        main.collect_list_object_versions_page("bucket", "1996/", "/", 10, None, None)
+    )
+
+    assert [(entry["Type"], entry["Name"]) for entry in entries] == [
+        ("CommonPrefix", "1996/01/"),
+        ("CommonPrefix", "1996/02/"),
+    ]
+    assert is_truncated is False
+    assert next_key_marker == ""
+    assert next_version_id_marker == ""
+    assert len(origin_client.calls) == 1
+    assert origin_client.calls[0]["Delimiter"] == "/"
+    assert len(overlay_client.calls) == 1
+    assert overlay_client.calls[0]["Delimiter"] == "/"
 
 
 def test_list_versions_ignores_overlay_delete_marker_facilitator(monkeypatch):

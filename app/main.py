@@ -1429,6 +1429,7 @@ class VersionItemStream:
         before=None,
         key_marker=None,
         version_id_marker=None,
+        delimiter=None,
         skip_facilitators=False,
     ):
         self.s3_client = s3_client
@@ -1439,6 +1440,7 @@ class VersionItemStream:
         self.before = before
         self.key_marker = key_marker
         self.version_id_marker = version_id_marker
+        self.delimiter = delimiter
         self.skip_facilitators = skip_facilitators
         self.exhausted = False
         self.buffer = []
@@ -1458,6 +1460,8 @@ class VersionItemStream:
             "Prefix": self.prefix,
             "MaxKeys": 1000,
         }
+        if self.delimiter:
+            request_params["Delimiter"] = self.delimiter
         if self.key_marker:
             request_params["KeyMarker"] = self.key_marker
             if self.version_id_marker:
@@ -1502,6 +1506,18 @@ class VersionItemStream:
                 transformed["OriginalKey"] = original_key
                 items.append(transformed)
 
+        for item in response.get("CommonPrefixes", []):
+            original_key = item["Prefix"]
+            key = self.key_transform(original_key)
+            if key is None:
+                continue
+            items.append({
+                "Key": key,
+                "ItemType": "CommonPrefix",
+                "Source": self.source,
+                "OriginalKey": original_key,
+            })
+
         items.sort(key=version_item_sort_key)
         self.buffer.extend(items)
         return bool(self.buffer) or not self.exhausted
@@ -1525,6 +1541,15 @@ def version_item_after_marker(item, key_marker, version_id_marker, marker_seen):
     return False, marker_seen
 
 def list_versions_entry_for_item(item, prefix, delimiter):
+    if item["ItemType"] == "CommonPrefix":
+        return {
+            "Type": "CommonPrefix",
+            "Name": item["Key"],
+            "Prefix": item["Key"],
+            "MarkerKey": item["Key"],
+            "MarkerVersionId": "",
+        }
+
     key = item["Key"]
     suffix = key[len(prefix):]
     if delimiter is not None and delimiter and delimiter in suffix:
@@ -1558,6 +1583,7 @@ def collect_list_object_versions_page(bucket, prefix, delimiter, max_keys, key_m
         "origin",
         before=START_TIME,
         key_marker=use_source_marker,
+        delimiter=delimiter,
     )
 
     overlay_root = f"{bucket}/"
@@ -1569,6 +1595,7 @@ def collect_list_object_versions_page(bucket, prefix, delimiter, max_keys, key_m
         lambda key: key[len(overlay_root):] if key.startswith(overlay_root) else None,
         "overlay",
         key_marker=overlay_source_marker,
+        delimiter=delimiter,
         skip_facilitators=True,
     )
 
@@ -1634,6 +1661,7 @@ class VersionedKeyStream:
         key_transform,
         before=None,
         key_marker=None,
+        delimiter=None,
         skip_facilitators=False,
     ):
         self.s3_client = s3_client
@@ -1642,6 +1670,7 @@ class VersionedKeyStream:
         self.key_transform = key_transform
         self.before = before
         self.key_marker = key_marker
+        self.delimiter = delimiter
         self.skip_facilitators = skip_facilitators
         self.version_id_marker = None
         self.exhausted = False
@@ -1649,6 +1678,7 @@ class VersionedKeyStream:
         self.current_key = None
         self.current_candidate = None
         self.skip_key = None
+        self.pending_item = None
 
     def next_state(self):
         while True:
@@ -1659,6 +1689,15 @@ class VersionedKeyStream:
                 return self._finish_current_key()
 
             key = item["Key"]
+            if item["ItemType"] == "CommonPrefix":
+                if self.current_key is None:
+                    return item
+                self.pending_item = item
+                result = self._finish_current_key()
+                if result is not None:
+                    return result
+                continue
+
             if self.skip_key is not None:
                 if key == self.skip_key:
                     continue
@@ -1680,6 +1719,11 @@ class VersionedKeyStream:
             self._consider_item(item)
 
     def _next_item(self):
+        if self.pending_item is not None:
+            item = self.pending_item
+            self.pending_item = None
+            return item
+
         while not self.buffer:
             if self.current_key is not None and self.current_candidate is not None:
                 return None
@@ -1696,6 +1740,8 @@ class VersionedKeyStream:
             "Prefix": self.prefix,
             "MaxKeys": 1000,
         }
+        if self.delimiter:
+            request_params["Delimiter"] = self.delimiter
         if self.key_marker:
             request_params["KeyMarker"] = self.key_marker
             if self.version_id_marker:
@@ -1736,7 +1782,17 @@ class VersionedKeyStream:
                 transformed["ItemType"] = item_type
                 items.append(transformed)
 
-        items.sort(key=lambda item: (item["Key"], -item["LastModified"].timestamp()))
+        for item in response.get("CommonPrefixes", []):
+            original_key = item["Prefix"]
+            key = self.key_transform(original_key)
+            if key is None:
+                continue
+            items.append({
+                "Key": key,
+                "ItemType": "CommonPrefix",
+            })
+
+        items.sort(key=versioned_key_item_sort_key)
         self.buffer.extend(items)
         return bool(self.buffer) or not self.exhausted
 
@@ -1772,6 +1828,11 @@ def list_v2_source_marker(prefix, marker):
         return None
     return marker
 
+def versioned_key_item_sort_key(item):
+    last_modified = item.get("LastModified")
+    timestamp = -last_modified.timestamp() if isinstance(last_modified, datetime) else 0
+    return (item["Key"], timestamp, item.get("ItemType", ""))
+
 def next_stream_state(stream):
     return stream.next_state() if stream is not None else None
 
@@ -1792,6 +1853,13 @@ def choose_merged_state(origin_state, overlay_state):
     return overlay_state, True, True
 
 def list_v2_entry_for_state(state, prefix, delimiter):
+    if state["ItemType"] == "CommonPrefix":
+        return {
+            "Type": "CommonPrefix",
+            "Name": state["Key"],
+            "Prefix": state["Key"],
+        }
+
     key = state["Key"]
     suffix = key[len(prefix):]
     if delimiter is not None and delimiter and delimiter in suffix:
@@ -1820,6 +1888,7 @@ def collect_list_objects_v2_page(bucket, prefix, delimiter, max_keys, marker):
         lambda key: key,
         before=START_TIME,
         key_marker=source_marker,
+        delimiter=delimiter,
     )
 
     overlay_root = f"{bucket}/"
@@ -1830,6 +1899,7 @@ def collect_list_objects_v2_page(bucket, prefix, delimiter, max_keys, marker):
         f"{overlay_root}{prefix}",
         lambda key: key[len(overlay_root):] if key.startswith(overlay_root) else None,
         key_marker=overlay_source_marker,
+        delimiter=delimiter,
         skip_facilitators=True,
     )
 
@@ -1844,7 +1914,7 @@ def collect_list_objects_v2_page(bucket, prefix, delimiter, max_keys, marker):
         if state is None:
             return entries, False, ""
 
-        if state["ItemType"] != "Version":
+        if state["ItemType"] not in {"Version", "CommonPrefix"}:
             if consume_origin:
                 origin_state = next_stream_state(origin_stream)
             if consume_overlay:
