@@ -61,6 +61,15 @@ TAG_FACILITATOR_METADATA = "s3-snapshot-proxy-tag-facilitator"
 TAG_FACILITATOR_BODY = b"s3-snapshot-proxy tag facilitator\n"
 TAG_FACILITATOR_ETAG = '"' + hashlib.md5(TAG_FACILITATOR_BODY).hexdigest() + '"'
 MAX_CONTROL_BODY_BYTES = int(os.environ.get("MAX_CONTROL_BODY_BYTES", str(10 * 1024 * 1024)))
+S3_SIGNED_PASSTHROUGH_HEADERS = {
+    "cache-control",
+    "content-disposition",
+    "content-encoding",
+    "content-language",
+    "content-md5",
+    "content-type",
+    "expires",
+}
 
 # Configurable base URLs
 OVERLAY_S3_URL = os.environ.get("OVERLAY_S3_URL", "http://overlay-s3.local")
@@ -222,7 +231,8 @@ origin_aws_auth = S3UnsignedPayloadAWS4Auth(
     secret_key=origin_credentials.secret_key,
     region=os.environ.get("AWS_REGION", "us-east-1"),
     service="s3",
-    security_token=origin_credentials.token
+    security_token=origin_credentials.token,
+    include_headers=S3_SIGNED_PASSTHROUGH_HEADERS,
 )
 
 overlay_aws_auth = S3UnsignedPayloadAWS4Auth(
@@ -230,7 +240,8 @@ overlay_aws_auth = S3UnsignedPayloadAWS4Auth(
     secret_key=overlay_credentials.secret_key,
     region=os.environ.get("AWS_REGION", "us-east-1"),
     service="s3",
-    security_token=overlay_credentials.token
+    security_token=overlay_credentials.token,
+    include_headers=S3_SIGNED_PASSTHROUGH_HEADERS,
 )
 
 # Unsigned client for origin S3 (or re-sign with origin_aws_auth when needed)
@@ -544,6 +555,9 @@ def overlay_header_value(name: str, value: str, preserve_content_length: bool = 
     if lower_name.startswith("x-amz"):
         return None
     return value
+
+def should_forward_overlay_header(name: str) -> bool:
+    return overlay_header_value(name, "placeholder") is not None
 
 def prepare_overlay_headers(headers: dict, preserve_content_length: bool = False) -> dict:
     result = {}
