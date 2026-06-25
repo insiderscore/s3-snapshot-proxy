@@ -1,4 +1,5 @@
 import datetime as datetime_module
+import asyncio
 import hmac
 import httpx
 from fastapi import FastAPI, Request, Response
@@ -20,6 +21,9 @@ import xml.etree.ElementTree as ET
 from typing import AsyncIterator, Optional
 import botocore.exceptions
 import hashlib
+
+async def run_sync_s3(func, *args, **kwargs):
+    return await asyncio.to_thread(func, *args, **kwargs)
 
 # Set up logging
 logging.basicConfig(
@@ -109,7 +113,8 @@ async def readiness_probe():
     
     # Check overlay S3 connection
     try:
-        s3_client_overlay = boto3.client(
+        s3_client_overlay = await run_sync_s3(
+            boto3.client,
             "s3",
             aws_access_key_id=overlay_credentials.access_key,
             aws_secret_access_key=overlay_credentials.secret_key,
@@ -117,7 +122,7 @@ async def readiness_probe():
             endpoint_url=OVERLAY_S3_URL
         )
         # Check if overlay bucket exists
-        s3_client_overlay.head_bucket(Bucket=OVERLAY_BUCKET)
+        await run_sync_s3(s3_client_overlay.head_bucket, Bucket=OVERLAY_BUCKET)
         status["components"]["overlay_s3"] = "connected"
     except Exception as e:
         logging.warning(f"Overlay S3 connection failed: {str(e)}")
@@ -127,7 +132,8 @@ async def readiness_probe():
     # We don't strictly need to check origin S3 if we're just reading from overlay
     # But include a basic check that credentials are valid
     try:
-        s3_client_origin = boto3.client(
+        s3_client_origin = await run_sync_s3(
+            boto3.client,
             "s3",
             aws_access_key_id=origin_credentials.access_key,
             aws_secret_access_key=origin_credentials.secret_key,
@@ -135,7 +141,7 @@ async def readiness_probe():
             endpoint_url=ORIGIN_S3_URL
         )
         # Just check if we can access the service
-        s3_client_origin.list_buckets()
+        await run_sync_s3(s3_client_origin.list_buckets)
         status["components"]["origin_s3"] = "connected"
     except Exception as e:
         # Origin failure is non-fatal if we're operating in overlay-only mode
@@ -777,6 +783,9 @@ def overlay_current_version_is_delete_marker(overlay_key: str) -> bool:
         headers = exc.response.get("ResponseMetadata", {}).get("HTTPHeaders", {})
         return (get_header(headers, "x-amz-delete-marker") or "").lower() == "true"
 
+def head_overlay_object(overlay_key: str):
+    return get_overlay_s3_client().head_object(Bucket=OVERLAY_BUCKET, Key=overlay_key)
+
 async def create_tag_facilitator_object(overlay_object_url: str) -> httpx.Response:
     headers = {
         f"x-amz-meta-{TAG_FACILITATOR_METADATA}": "true",
@@ -813,16 +822,19 @@ async def handle_object_tagging_request(
     if response.status_code != 404 or query_has_param(query_string, "versionId"):
         return response_from_httpx(response)
 
-    origin_obj = check_object_at_start_time(bucket, key)
-    if origin_obj is None or overlay_current_version_is_delete_marker(overlay_path):
+    origin_obj = await run_sync_s3(check_object_at_start_time, bucket, key)
+    overlay_is_delete_marker = await run_sync_s3(overlay_current_version_is_delete_marker, overlay_path)
+    if origin_obj is None or overlay_is_delete_marker:
         return response_from_httpx(response)
 
     if method == "GET":
         try:
-            tagging = get_origin_s3_client().get_object_tagging(
-                Bucket=bucket,
-                Key=key,
-                VersionId=origin_obj["VersionId"],
+            tagging = await run_sync_s3(
+                lambda: get_origin_s3_client().get_object_tagging(
+                    Bucket=bucket,
+                    Key=key,
+                    VersionId=origin_obj["VersionId"],
+                )
             )
         except botocore.exceptions.ClientError:
             return response_from_httpx(response)
@@ -966,7 +978,7 @@ def create_delete_marker_facilitator(s3_client_overlay, overlay_key: str):
         Metadata={DELETE_MARKER_FACILITATOR_METADATA: "true"},
     )
 
-async def handle_multi_object_delete_request(full_path: str, body: bytes) -> Response:
+def _handle_multi_object_delete_request_sync(full_path: str, body: bytes) -> Response:
     bucket, key = split_bucket_key(full_path)
     if key:
         return s3_error_response(
@@ -1064,6 +1076,9 @@ async def handle_multi_object_delete_request(full_path: str, body: bytes) -> Res
         media_type="application/xml",
     )
 
+async def handle_multi_object_delete_request(full_path: str, body: bytes) -> Response:
+    return await run_sync_s3(_handle_multi_object_delete_request_sync, full_path, body)
+
 async def handle_precondition_failure(
     method: str,
     full_path: str,
@@ -1087,7 +1102,7 @@ async def handle_precondition_failure(
     logging.info("Received 412. Checking object state at START_TIME for: %s, key: %s", bucket, key)
     
     # Use our comprehensive function that properly handles delete markers and pagination
-    origin_obj = check_object_at_start_time(bucket, key)
+    origin_obj = await run_sync_s3(check_object_at_start_time, bucket, key)
     
     if origin_obj is None:
         logging.info("No matching version found for key %s before START_TIME. Returning 404.", key)
@@ -1171,7 +1186,7 @@ async def open_precondition_version_stream(
         return httpx.Response(status_code=412, content=b"")
 
     logging.info("Received 412. Checking object state at START_TIME for: %s, key: %s", bucket, key)
-    origin_obj = check_object_at_start_time(bucket, key)
+    origin_obj = await run_sync_s3(check_object_at_start_time, bucket, key)
     if origin_obj is None:
         logging.info("No matching version found for key %s before START_TIME. Returning 404.", key)
         return httpx.Response(status_code=404, content=b"")
@@ -2244,7 +2259,8 @@ async def list_objects_handler(bucket: str, request: Request, prefix: str = ""):
         max_uploads = int(params.get("max-uploads", "1000"))
         key_marker = params.get("key-marker")
         upload_id_marker = params.get("upload-id-marker")
-        xml_response = process_list_multipart_uploads(
+        xml_response = await run_sync_s3(
+            process_list_multipart_uploads,
             bucket=bucket,
             prefix=list_uploads_prefix,
             delimiter=delimiter,
@@ -2263,7 +2279,8 @@ async def list_objects_handler(bucket: str, request: Request, prefix: str = ""):
         continuation_token = params.get("continuation-token")
         start_after = params.get("start-after")
         marker = continuation_token or start_after
-        paginated, is_truncated, next_token = collect_list_objects_v2_page(
+        paginated, is_truncated, next_token = await run_sync_s3(
+            collect_list_objects_v2_page,
             bucket,
             prefix,
             delimiter,
@@ -2318,7 +2335,8 @@ async def list_objects_handler(bucket: str, request: Request, prefix: str = ""):
         key_marker = params.get("key-marker")
         version_id_marker = params.get("version-id-marker")
         
-        xml_response = process_list_versions(
+        xml_response = await run_sync_s3(
+            process_list_versions,
             bucket=bucket,
             prefix=prefix,
             delimiter=delimiter,
@@ -2336,7 +2354,8 @@ async def list_objects_handler(bucket: str, request: Request, prefix: str = ""):
         max_keys, max_keys_error = parse_nonnegative_int(params.get("max-keys"), "max-keys", 1000)
         if max_keys_error:
             return max_keys_error
-        xml_response = process_list_objects_v1(
+        xml_response = await run_sync_s3(
+            process_list_objects_v1,
             bucket=bucket,
             prefix=prefix,
             delimiter=delimiter,
@@ -2375,10 +2394,9 @@ async def handle_conditional_mutation(
     logging.info("Conditional mutation failed with 412. Checking if condition can be satisfied via origin.")
     
     # Check if object exists in overlay first (to avoid race conditions)
-    s3_client_overlay = get_overlay_s3_client()
     try:
         overlay_path = f"{bucket}/{key}"
-        s3_client_overlay.head_object(Bucket=OVERLAY_BUCKET, Key=overlay_path)
+        await run_sync_s3(head_overlay_object, overlay_path)
         # If we get here, object exists in overlay - respect the 412 from overlay
         logging.info("Object exists in overlay. Respecting 412 Precondition Failed.")
         return response
@@ -2387,7 +2405,7 @@ async def handle_conditional_mutation(
         pass
     
     try:
-        origin_obj = check_object_at_start_time(bucket, key)
+        origin_obj = await run_sync_s3(check_object_at_start_time, bucket, key)
 
         if origin_obj is None:
             logging.info("No version of object existed at START_TIME, original 412 response is correct")
@@ -2551,12 +2569,9 @@ async def handle_if_none_match_star_put(
     bucket, key = split_bucket_key(full_path)
     overlay_path = f"{bucket}/{key}"
     
-    # Initialize the overlay S3 client
-    s3_client_overlay = get_overlay_s3_client()
-    
     # First check if object exists in overlay
     try:
-        s3_client_overlay.head_object(Bucket=OVERLAY_BUCKET, Key=overlay_path)
+        await run_sync_s3(head_overlay_object, overlay_path)
         # Object exists in overlay, return 412
         logging.info(f"If-None-Match: * condition not satisfied - object exists in overlay: {overlay_path}")
         return Response(
@@ -2571,7 +2586,7 @@ async def handle_if_none_match_star_put(
         if error_code == "NoSuchKey" or error_code == "404":
             # Now check origin at START_TIME
             try:
-                origin_obj = check_object_at_start_time(bucket, key)
+                origin_obj = await run_sync_s3(check_object_at_start_time, bucket, key)
                 if origin_obj:
                     # Object exists in origin at START_TIME, return 412
                     logging.info(f"If-None-Match: * condition not satisfied - object exists in origin at START_TIME: {bucket}/{key}")
@@ -2625,10 +2640,9 @@ async def prepare_streaming_put_conditions(
 
     bucket, key = split_bucket_key(full_path)
     overlay_path = f"{bucket}/{key}"
-    s3_client_overlay = get_overlay_s3_client()
 
     try:
-        s3_client_overlay.head_object(Bucket=OVERLAY_BUCKET, Key=overlay_path)
+        await run_sync_s3(head_overlay_object, overlay_path)
         return None, overlay_headers
     except botocore.exceptions.ClientError as exc:
         error_code = exc.response.get("Error", {}).get("Code")
@@ -2640,7 +2654,7 @@ async def prepare_streaming_put_conditions(
                 headers={"Content-Type": "text/plain"},
             ), overlay_headers
 
-    origin_obj = check_object_at_start_time(bucket, key)
+    origin_obj = await run_sync_s3(check_object_at_start_time, bucket, key)
     if origin_obj is None:
         etags = [tag.strip(' "') for tag in if_match.split(",")]
         if "*" in etags:
