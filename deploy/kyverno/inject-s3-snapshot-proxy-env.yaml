@@ -1,0 +1,120 @@
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: inject-s3-snapshot-proxy-env
+  annotations:
+    pod-policies.kyverno.io/autogen-controllers: "none"
+spec:
+  background: false
+  rules:
+    - name: route-init-without-env
+      match:
+        any:
+          - resources:
+              kinds:
+                - Pod
+              operations:
+                - CREATE
+              namespaceSelector:
+                matchLabels:
+                  s3-snapshot-proxy.insiderscore.com/inject: "enabled"
+      preconditions:
+        all:
+          - key: "{{ request.object.metadata.annotations.\"s3-snapshot-proxy.insiderscore.com/inject\" || '' }}"
+            operator: NotEquals
+            value: "disabled"
+          - key: "{{ request.object.spec.hostNetwork || `false` }}"
+            operator: Equals
+            value: false
+      mutate:
+        foreach:
+          - list: "request.object.spec.initContainers || `[]`"
+            preconditions:
+              all:
+                - key: "{{ element.name }}"
+                  operator: NotEquals
+                  value: s3-snapshot-proxy
+                - key: "{{ length(element.env || `[]`) }}"
+                  operator: Equals
+                  value: 0
+            patchesJson6902: |-
+              - op: add
+                path: /spec/initContainers/{{elementIndex}}/env
+                value:
+                  - name: AWS_ENDPOINT_URL_S3
+                    value: "http://127.0.0.1:9000"
+
+    - name: route-init-with-env
+      match:
+        any:
+          - resources:
+              kinds:
+                - Pod
+              operations:
+                - CREATE
+              namespaceSelector:
+                matchLabels:
+                  s3-snapshot-proxy.insiderscore.com/inject: "enabled"
+      preconditions:
+        all:
+          - key: "{{ request.object.metadata.annotations.\"s3-snapshot-proxy.insiderscore.com/inject\" || '' }}"
+            operator: NotEquals
+            value: "disabled"
+          - key: "{{ request.object.spec.hostNetwork || `false` }}"
+            operator: Equals
+            value: false
+      mutate:
+        foreach:
+          - list: "request.object.spec.initContainers || `[]`"
+            preconditions:
+              all:
+                - key: "{{ element.name }}"
+                  operator: NotEquals
+                  value: s3-snapshot-proxy
+                - key: "{{ length(element.env || `[]`) }}"
+                  operator: GreaterThan
+                  value: 0
+                - key: "{{ length(element.env[?name == 'AWS_ENDPOINT_URL_S3'] || `[]`) }}"
+                  operator: Equals
+                  value: 0
+            patchesJson6902: |-
+              - op: add
+                path: /spec/initContainers/{{elementIndex}}/env/-
+                value:
+                  name: AWS_ENDPOINT_URL_S3
+                  value: "http://127.0.0.1:9000"
+
+    - name: route-s3-sdk-traffic-to-sidecar
+      match:
+        any:
+          - resources:
+              kinds:
+                - Pod
+              operations:
+                - CREATE
+              namespaceSelector:
+                matchLabels:
+                  s3-snapshot-proxy.insiderscore.com/inject: "enabled"
+      preconditions:
+        all:
+          - key: "{{ request.object.metadata.annotations.\"s3-snapshot-proxy.insiderscore.com/inject\" || '' }}"
+            operator: NotEquals
+            value: "disabled"
+          - key: "{{ request.object.spec.hostNetwork || `false` }}"
+            operator: Equals
+            value: false
+      mutate:
+        foreach:
+          - list: "request.object.spec.containers"
+            preconditions:
+              all:
+                - key: "{{ element.name }}"
+                  operator: NotEquals
+                  value: s3-snapshot-proxy
+            patchStrategicMerge:
+              spec:
+                containers:
+                  - (name): "{{ element.name }}"
+                    env:
+                      - name: AWS_ENDPOINT_URL_S3
+                        value: "http://127.0.0.1:9000"
