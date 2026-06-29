@@ -3,7 +3,7 @@
 This bundle applies two admission policies to Pods created in namespaces labeled:
 
 ```yaml
-s3-snapshot-proxy.insiderscore.com/inject: "enabled"
+s3-snapshot-proxy.inject: "enabled"
 ```
 
 Each opted-in namespace must also contain a `s3-snapshot-proxy-config`
@@ -28,25 +28,27 @@ Pods can opt out with:
 ```yaml
 metadata:
   annotations:
-    s3-snapshot-proxy.insiderscore.com/inject: disabled
+    s3-snapshot-proxy.inject: disabled
 ```
 
 ## Namespace Config
 
-Minimum namespace-local config:
+Minimum namespace-local config. The example uses shell-style placeholders;
+render them with Flux post-build substitution, `envsubst`, Helm, Kustomize
+replacements, or another deployment-time templating mechanism.
 
 ```yaml
 apiVersion: v1
 kind: ConfigMap
 metadata:
   name: s3-snapshot-proxy-config
-  namespace: apps
+  namespace: ${S3_SNAPSHOT_PROXY_NAMESPACE}
 data:
-  IMAGE: 675770171148.dkr.ecr.us-east-1.amazonaws.com/s3-snapshot-proxy-test:sidecar-smoke
-  AWS_REGION: us-east-1
-  ORIGIN_S3_URL: https://s3.us-east-1.amazonaws.com
-  OVERLAY_S3_URL: https://s3.us-east-1.amazonaws.com
-  OVERLAY_BUCKET: staging-iscore-s3-snapshot-proxy-smoke
+  IMAGE: ${S3_SNAPSHOT_PROXY_IMAGE}
+  AWS_REGION: ${S3_SNAPSHOT_PROXY_AWS_REGION}
+  ORIGIN_S3_URL: ${S3_SNAPSHOT_PROXY_ORIGIN_S3_URL}
+  OVERLAY_S3_URL: ${S3_SNAPSHOT_PROXY_OVERLAY_S3_URL}
+  OVERLAY_BUCKET: ${S3_SNAPSHOT_PROXY_OVERLAY_BUCKET}
 ```
 
 `MAX_CONTROL_BODY_BYTES` is optional.
@@ -54,7 +56,7 @@ data:
 ## Notes
 
 The policies intentionally mutate Pods on admission rather than higher-level
-controllers. GitOps manifests remain readable, while created Pods are forced
+controllers. Source manifests remain readable, while created Pods are forced
 through the local S3 endpoint in opted-in namespaces.
 
 The sidecar must be first because init containers are ordered. The environment

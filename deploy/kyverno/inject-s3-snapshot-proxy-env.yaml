@@ -17,10 +17,10 @@ spec:
                 - CREATE
               namespaceSelector:
                 matchLabels:
-                  s3-snapshot-proxy.insiderscore.com/inject: "enabled"
+                  s3-snapshot-proxy.inject: "enabled"
       preconditions:
         all:
-          - key: "{{ request.object.metadata.annotations.\"s3-snapshot-proxy.insiderscore.com/inject\" || '' }}"
+          - key: "{{ request.object.metadata.annotations.\"s3-snapshot-proxy.inject\" || '' }}"
             operator: NotEquals
             value: "disabled"
           - key: "{{ request.object.spec.hostNetwork || `false` }}"
@@ -54,10 +54,10 @@ spec:
                 - CREATE
               namespaceSelector:
                 matchLabels:
-                  s3-snapshot-proxy.insiderscore.com/inject: "enabled"
+                  s3-snapshot-proxy.inject: "enabled"
       preconditions:
         all:
-          - key: "{{ request.object.metadata.annotations.\"s3-snapshot-proxy.insiderscore.com/inject\" || '' }}"
+          - key: "{{ request.object.metadata.annotations.\"s3-snapshot-proxy.inject\" || '' }}"
             operator: NotEquals
             value: "disabled"
           - key: "{{ request.object.spec.hostNetwork || `false` }}"
@@ -94,10 +94,10 @@ spec:
                 - CREATE
               namespaceSelector:
                 matchLabels:
-                  s3-snapshot-proxy.insiderscore.com/inject: "enabled"
+                  s3-snapshot-proxy.inject: "enabled"
       preconditions:
         all:
-          - key: "{{ request.object.metadata.annotations.\"s3-snapshot-proxy.insiderscore.com/inject\" || '' }}"
+          - key: "{{ request.object.metadata.annotations.\"s3-snapshot-proxy.inject\" || '' }}"
             operator: NotEquals
             value: "disabled"
           - key: "{{ request.object.spec.hostNetwork || `false` }}"
