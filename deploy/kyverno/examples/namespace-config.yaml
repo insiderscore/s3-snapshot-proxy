@@ -3,7 +3,7 @@ kind: Namespace
 metadata:
   name: ${S3_SNAPSHOT_PROXY_NAMESPACE}
   labels:
-    s3-snapshot-proxy.inject: "enabled"
+    s3-snapshot-proxy.insiderscore.com/inject: "enabled"
 ---
 apiVersion: v1
 kind: ConfigMap

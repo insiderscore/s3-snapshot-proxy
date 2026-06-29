@@ -3,7 +3,7 @@
 This bundle applies two admission policies to Pods created in namespaces labeled:
 
 ```yaml
-s3-snapshot-proxy.inject: "enabled"
+s3-snapshot-proxy.insiderscore.com/inject: "enabled"
 ```
 
 Each opted-in namespace must also contain a `s3-snapshot-proxy-config`
@@ -28,7 +28,7 @@ Pods can opt out with:
 ```yaml
 metadata:
   annotations:
-    s3-snapshot-proxy.inject: disabled
+    s3-snapshot-proxy.insiderscore.com/inject: disabled
 ```
 
 ## Namespace Config

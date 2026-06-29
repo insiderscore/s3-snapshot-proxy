@@ -17,7 +17,7 @@ spec:
                 - CREATE
               namespaceSelector:
                 matchLabels:
-                  s3-snapshot-proxy.inject: "enabled"
+                  s3-snapshot-proxy.insiderscore.com/inject: "enabled"
       context:
         - name: proxyConfig
           configMap:
@@ -25,7 +25,7 @@ spec:
             namespace: "{{ request.namespace }}"
       preconditions:
         all:
-          - key: "{{ request.object.metadata.annotations.\"s3-snapshot-proxy.inject\" || '' }}"
+          - key: "{{ request.object.metadata.annotations.\"s3-snapshot-proxy.insiderscore.com/inject\" || '' }}"
             operator: NotEquals
             value: "disabled"
           - key: "{{ request.object.spec.hostNetwork || `false` }}"
@@ -118,7 +118,7 @@ spec:
                 - CREATE
               namespaceSelector:
                 matchLabels:
-                  s3-snapshot-proxy.inject: "enabled"
+                  s3-snapshot-proxy.insiderscore.com/inject: "enabled"
       context:
         - name: proxyConfig
           configMap:
@@ -126,7 +126,7 @@ spec:
             namespace: "{{ request.namespace }}"
       preconditions:
         all:
-          - key: "{{ request.object.metadata.annotations.\"s3-snapshot-proxy.inject\" || '' }}"
+          - key: "{{ request.object.metadata.annotations.\"s3-snapshot-proxy.insiderscore.com/inject\" || '' }}"
             operator: NotEquals
             value: "disabled"
           - key: "{{ request.object.spec.hostNetwork || `false` }}"
