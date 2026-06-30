@@ -167,6 +167,13 @@ def tag_pairs(response):
         for tag in response.get("TagSet", [])
     }
 
+def xml_text(content, name):
+    root = ET.fromstring(content)
+    for elem in root.iter():
+        if elem.tag.rsplit("}", 1)[-1] == name:
+            return elem.text
+    return None
+
 def aws_chunked_body(payload):
     midpoint = max(1, len(payload) // 2)
     chunks = [payload[:midpoint], payload[midpoint:]]
@@ -2059,6 +2066,58 @@ def test_multipart_upload_via_proxy():
     )
     assert overlay_versions.get("Versions", []) == []
     assert overlay_versions.get("DeleteMarkers", []) == []
+
+def test_complete_multipart_upload_ignores_part_checksum_elements():
+    bucket = "origin-bucket1"
+    key = f"multipart/checksum-complete-{random.randint(1000, 9999)}"
+    body = b"multipart upload with client-side checksum completion metadata"
+    upload_id = None
+    completed = False
+
+    try:
+        initiated = requests.post(f"http://s3proxy:9000/{bucket}/{key}?uploads")
+        assert initiated.status_code == 200, initiated.text
+        upload_id = xml_text(initiated.content, "UploadId")
+        assert upload_id
+
+        uploaded = requests.put(
+            f"http://s3proxy:9000/{bucket}/{key}",
+            params={"partNumber": "1", "uploadId": upload_id},
+            data=body,
+            headers={"Content-Length": str(len(body))},
+        )
+        assert uploaded.status_code == 200, uploaded.text
+
+        complete_body = f"""
+        <CompleteMultipartUpload>
+          <Part>
+            <PartNumber>1</PartNumber>
+            <ETag>{uploaded.headers["ETag"]}</ETag>
+            <ChecksumCRC32C>AAAAAA==</ChecksumCRC32C>
+          </Part>
+        </CompleteMultipartUpload>
+        """.encode("utf-8")
+        completed_response = requests.post(
+            f"http://s3proxy:9000/{bucket}/{key}",
+            params={"uploadId": upload_id},
+            data=complete_body,
+            headers={
+                "Content-Type": "application/xml",
+                "Content-Length": str(len(complete_body)),
+            },
+        )
+        assert completed_response.status_code == 200, completed_response.text
+        completed = True
+    finally:
+        if upload_id and not completed:
+            requests.delete(
+                f"http://s3proxy:9000/{bucket}/{key}",
+                params={"uploadId": upload_id},
+            )
+
+    fetched = requests.get(f"http://s3proxy:9000/{bucket}/{key}")
+    assert fetched.status_code == 200, fetched.text
+    assert fetched.content == body
 
 def test_list_multipart_uploads_via_proxy():
     print("\n=== Testing ListMultipartUploads ===\n")

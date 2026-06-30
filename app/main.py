@@ -724,6 +724,40 @@ def rewrite_multipart_xml_response(
         content=ET.tostring(root, encoding="utf-8", method="xml"),
     )
 
+COMPLETE_MULTIPART_CHECKSUM_ELEMENTS = {
+    "ChecksumCRC32",
+    "ChecksumCRC32C",
+    "ChecksumCRC64NVME",
+    "ChecksumSHA1",
+    "ChecksumSHA256",
+}
+
+def strip_complete_multipart_upload_checksums(body: bytes) -> tuple[bytes, bool]:
+    try:
+        root = ET.fromstring(body)
+    except ET.ParseError:
+        return body, False
+
+    if xml_local_name(root.tag) != "CompleteMultipartUpload":
+        return body, False
+
+    if root.tag.startswith("{"):
+        namespace = root.tag[1:].split("}", 1)[0]
+        ET.register_namespace("", namespace)
+
+    changed = False
+    for part in root:
+        if xml_local_name(part.tag) != "Part":
+            continue
+        for child in list(part):
+            if xml_local_name(child.tag) in COMPLETE_MULTIPART_CHECKSUM_ELEMENTS:
+                part.remove(child)
+                changed = True
+
+    if not changed:
+        return body, False
+    return ET.tostring(root, encoding="utf-8", method="xml"), True
+
 async def handle_delete_request(overlay_url: str, overlay_headers: dict, body: bytes) -> httpx.Response:
     """
     Handle DELETE requests against the versioned overlay bucket.
@@ -2787,6 +2821,12 @@ async def proxy(full_path: str, request: Request):
                 "Control-plane request body exceeds the proxy limit",
                 413,
             )
+
+        if method == "POST" and query_has_param(query_string, "uploadId"):
+            body, stripped_checksums = strip_complete_multipart_upload_checksums(body)
+            if stripped_checksums:
+                remove_body_integrity_headers(overlay_headers)
+                logging.info("Removed CompleteMultipartUpload checksum elements before overlay forwarding")
 
         logging.info("Sending overlay request: %s %s", method, overlay_url)
         response = await forward_s3_request(signed_client, method, overlay_url, headers=overlay_headers, content=body)

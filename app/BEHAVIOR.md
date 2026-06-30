@@ -110,6 +110,12 @@ Handling of multipart uploads:
   Upload state exists only in the overlay bucket, and an aborted upload
   must not create a delete marker.
 
+- Request body checksum and streaming trailer metadata are not forwarded while
+  the proxy decodes aws-chunked upload bodies and re-signs overlay writes.
+  CompleteMultipartUpload per-part checksum elements are stripped before
+  forwarding so the completion request remains consistent with the uploaded
+  overlay parts.
+
 - Bucket-level ListMultipartUploads is served from the overlay bucket with
   the virtual bucket name applied as an overlay prefix. Returned keys,
   common prefixes, key markers, and next key markers are rewritten back to
