@@ -1,0 +1,294 @@
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: inject-s3-snapshot-proxy-mountpoint-sidecar
+  annotations:
+    pod-policies.kyverno.io/autogen-controllers: "none"
+spec:
+  background: false
+  rules:
+    - name: inject-mountpoint-proxy-no-initcontainers
+      match:
+        any:
+          - resources:
+              kinds:
+                - Pod
+              operations:
+                - CREATE
+              namespaceSelector:
+                matchLabels:
+                  s3-snapshot-proxy.insiderscore.com/mountpoint-inject: "enabled"
+      context:
+        - name: mountpointPV
+          apiCall:
+            urlPath: "/api/v1/persistentvolumes/{{ request.object.metadata.annotations.\"s3.csi.aws.com/volume-name\" || '' }}"
+            default: {}
+        - name: workloadPVC
+          apiCall:
+            urlPath: "/api/v1/namespaces/{{ mountpointPV.spec.claimRef.namespace || '' }}/persistentvolumeclaims/{{ mountpointPV.spec.claimRef.name || '' }}"
+            default: {}
+        - name: proxyConfig
+          apiCall:
+            urlPath: "/api/v1/namespaces/{{ mountpointPV.spec.claimRef.namespace || '' }}/configmaps/s3-snapshot-proxy-config"
+            default: {}
+      preconditions:
+        all:
+          - key: "{{ request.object.metadata.annotations.\"s3.csi.aws.com/volume-id\" || '' }}"
+            operator: NotEquals
+            value: ""
+          - key: "{{ request.object.metadata.annotations.\"s3.csi.aws.com/volume-name\" || '' }}"
+            operator: NotEquals
+            value: ""
+          - key: "{{ mountpointPV.spec.claimRef.namespace || '' }}"
+            operator: NotEquals
+            value: ""
+          - key: "{{ mountpointPV.spec.claimRef.name || '' }}"
+            operator: NotEquals
+            value: ""
+          - key: "{{ workloadPVC.metadata.annotations.\"s3-snapshot-proxy.insiderscore.com/mountpoint-inject\" || '' }}"
+            operator: Equals
+            value: "enabled"
+          - key: "{{ contains(mountpointPV.spec.mountOptions || `[]`, 'endpoint-url http://127.0.0.1:9000') }}"
+            operator: Equals
+            value: true
+          - key: "{{ contains(mountpointPV.spec.mountOptions || `[]`, 'force-path-style') }}"
+            operator: Equals
+            value: true
+          - key: "{{ proxyConfig.data.IMAGE || '' }}"
+            operator: NotEquals
+            value: ""
+          - key: "{{ proxyConfig.data.AWS_REGION || '' }}"
+            operator: NotEquals
+            value: ""
+          - key: "{{ proxyConfig.data.OVERLAY_BUCKET || '' }}"
+            operator: NotEquals
+            value: ""
+          - key: "{{ length(request.object.spec.containers[?name == 's3-snapshot-proxy']) }}"
+            operator: Equals
+            value: 0
+          - key: "{{ length(request.object.spec.initContainers[?name == 's3-snapshot-proxy'] || `[]`) }}"
+            operator: Equals
+            value: 0
+          - key: "{{ length(request.object.spec.initContainers || `[]`) }}"
+            operator: Equals
+            value: 0
+      mutate:
+        patchesJson6902: |-
+          - op: add
+            path: /spec/initContainers
+            value:
+              - name: s3-snapshot-proxy
+                image: "{{ proxyConfig.data.IMAGE }}"
+                imagePullPolicy: IfNotPresent
+                restartPolicy: Always
+                env:
+                  - name: MOUNTPOINT_POD_CREDENTIALS
+                    value: "auto"
+                  - name: MOUNTPOINT_POD_NAME
+                    valueFrom:
+                      fieldRef:
+                        fieldPath: metadata.name
+                  - name: MOUNTPOINT_POD_UID
+                    valueFrom:
+                      fieldRef:
+                        fieldPath: metadata.uid
+                  - name: MOUNTPOINT_VOLUME_ID
+                    valueFrom:
+                      fieldRef:
+                        fieldPath: metadata.annotations['s3.csi.aws.com/volume-id']
+                  - name: AWS_REGION
+                    value: "{{ proxyConfig.data.AWS_REGION }}"
+                  - name: AWS_EC2_METADATA_DISABLED
+                    value: "true"
+                  - name: ORIGIN_S3_URL
+                    value: "{{ proxyConfig.data.ORIGIN_S3_URL || 'https://s3.amazonaws.com' }}"
+                  - name: OVERLAY_S3_URL
+                    value: "{{ proxyConfig.data.OVERLAY_S3_URL || 'https://s3.amazonaws.com' }}"
+                  - name: OVERLAY_BUCKET
+                    value: "{{ proxyConfig.data.OVERLAY_BUCKET }}"
+                  - name: MAX_CONTROL_BODY_BYTES
+                    value: "{{ proxyConfig.data.MAX_CONTROL_BODY_BYTES || '10485760' }}"
+                  - name: MOUNTPOINT_CREDENTIAL_DISCOVERY_TIMEOUT_SECONDS
+                    value: "{{ proxyConfig.data.MOUNTPOINT_CREDENTIAL_DISCOVERY_TIMEOUT_SECONDS || '30' }}"
+                ports:
+                  - name: s3-proxy
+                    containerPort: 9000
+                startupProbe:
+                  httpGet:
+                    path: /health
+                    port: s3-proxy
+                  periodSeconds: 2
+                  failureThreshold: 30
+                readinessProbe:
+                  httpGet:
+                    path: /health
+                    port: s3-proxy
+                  periodSeconds: 5
+                  failureThreshold: 3
+                livenessProbe:
+                  httpGet:
+                    path: /livez
+                    port: s3-proxy
+                  periodSeconds: 20
+                  failureThreshold: 3
+                securityContext:
+                  allowPrivilegeEscalation: false
+                  capabilities:
+                    drop:
+                      - ALL
+                  runAsGroup: 1000
+                  runAsNonRoot: true
+                  runAsUser: 1000
+                  seccompProfile:
+                    type: RuntimeDefault
+                volumeMounts:
+                  - name: comm
+                    mountPath: /comm
+                resources:
+                  requests:
+                    memory: 128Mi
+                  limits:
+                    memory: 1Gi
+
+    - name: inject-mountpoint-proxy-with-initcontainers
+      match:
+        any:
+          - resources:
+              kinds:
+                - Pod
+              operations:
+                - CREATE
+              namespaceSelector:
+                matchLabels:
+                  s3-snapshot-proxy.insiderscore.com/mountpoint-inject: "enabled"
+      context:
+        - name: mountpointPV
+          apiCall:
+            urlPath: "/api/v1/persistentvolumes/{{ request.object.metadata.annotations.\"s3.csi.aws.com/volume-name\" || '' }}"
+            default: {}
+        - name: workloadPVC
+          apiCall:
+            urlPath: "/api/v1/namespaces/{{ mountpointPV.spec.claimRef.namespace || '' }}/persistentvolumeclaims/{{ mountpointPV.spec.claimRef.name || '' }}"
+            default: {}
+        - name: proxyConfig
+          apiCall:
+            urlPath: "/api/v1/namespaces/{{ mountpointPV.spec.claimRef.namespace || '' }}/configmaps/s3-snapshot-proxy-config"
+            default: {}
+      preconditions:
+        all:
+          - key: "{{ request.object.metadata.annotations.\"s3.csi.aws.com/volume-id\" || '' }}"
+            operator: NotEquals
+            value: ""
+          - key: "{{ request.object.metadata.annotations.\"s3.csi.aws.com/volume-name\" || '' }}"
+            operator: NotEquals
+            value: ""
+          - key: "{{ mountpointPV.spec.claimRef.namespace || '' }}"
+            operator: NotEquals
+            value: ""
+          - key: "{{ mountpointPV.spec.claimRef.name || '' }}"
+            operator: NotEquals
+            value: ""
+          - key: "{{ workloadPVC.metadata.annotations.\"s3-snapshot-proxy.insiderscore.com/mountpoint-inject\" || '' }}"
+            operator: Equals
+            value: "enabled"
+          - key: "{{ contains(mountpointPV.spec.mountOptions || `[]`, 'endpoint-url http://127.0.0.1:9000') }}"
+            operator: Equals
+            value: true
+          - key: "{{ contains(mountpointPV.spec.mountOptions || `[]`, 'force-path-style') }}"
+            operator: Equals
+            value: true
+          - key: "{{ proxyConfig.data.IMAGE || '' }}"
+            operator: NotEquals
+            value: ""
+          - key: "{{ proxyConfig.data.AWS_REGION || '' }}"
+            operator: NotEquals
+            value: ""
+          - key: "{{ proxyConfig.data.OVERLAY_BUCKET || '' }}"
+            operator: NotEquals
+            value: ""
+          - key: "{{ length(request.object.spec.containers[?name == 's3-snapshot-proxy']) }}"
+            operator: Equals
+            value: 0
+          - key: "{{ length(request.object.spec.initContainers[?name == 's3-snapshot-proxy'] || `[]`) }}"
+            operator: Equals
+            value: 0
+          - key: "{{ length(request.object.spec.initContainers || `[]`) }}"
+            operator: GreaterThan
+            value: 0
+      mutate:
+        patchesJson6902: |-
+          - op: add
+            path: /spec/initContainers/0
+            value:
+              name: s3-snapshot-proxy
+              image: "{{ proxyConfig.data.IMAGE }}"
+              imagePullPolicy: IfNotPresent
+              restartPolicy: Always
+              env:
+                - name: MOUNTPOINT_POD_CREDENTIALS
+                  value: "auto"
+                - name: MOUNTPOINT_POD_NAME
+                  valueFrom:
+                    fieldRef:
+                      fieldPath: metadata.name
+                - name: MOUNTPOINT_POD_UID
+                  valueFrom:
+                    fieldRef:
+                      fieldPath: metadata.uid
+                - name: MOUNTPOINT_VOLUME_ID
+                  valueFrom:
+                    fieldRef:
+                      fieldPath: metadata.annotations['s3.csi.aws.com/volume-id']
+                - name: AWS_REGION
+                  value: "{{ proxyConfig.data.AWS_REGION }}"
+                - name: AWS_EC2_METADATA_DISABLED
+                  value: "true"
+                - name: ORIGIN_S3_URL
+                  value: "{{ proxyConfig.data.ORIGIN_S3_URL || 'https://s3.amazonaws.com' }}"
+                - name: OVERLAY_S3_URL
+                  value: "{{ proxyConfig.data.OVERLAY_S3_URL || 'https://s3.amazonaws.com' }}"
+                - name: OVERLAY_BUCKET
+                  value: "{{ proxyConfig.data.OVERLAY_BUCKET }}"
+                - name: MAX_CONTROL_BODY_BYTES
+                  value: "{{ proxyConfig.data.MAX_CONTROL_BODY_BYTES || '10485760' }}"
+                - name: MOUNTPOINT_CREDENTIAL_DISCOVERY_TIMEOUT_SECONDS
+                  value: "{{ proxyConfig.data.MOUNTPOINT_CREDENTIAL_DISCOVERY_TIMEOUT_SECONDS || '30' }}"
+              ports:
+                - name: s3-proxy
+                  containerPort: 9000
+              startupProbe:
+                httpGet:
+                  path: /health
+                  port: s3-proxy
+                periodSeconds: 2
+                failureThreshold: 30
+              readinessProbe:
+                httpGet:
+                  path: /health
+                  port: s3-proxy
+                periodSeconds: 5
+                failureThreshold: 3
+              livenessProbe:
+                httpGet:
+                  path: /livez
+                  port: s3-proxy
+                periodSeconds: 20
+                failureThreshold: 3
+              securityContext:
+                allowPrivilegeEscalation: false
+                capabilities:
+                  drop:
+                    - ALL
+                runAsGroup: 1000
+                runAsNonRoot: true
+                runAsUser: 1000
+                seccompProfile:
+                  type: RuntimeDefault
+              volumeMounts:
+                - name: comm
+                  mountPath: /comm
+              resources:
+                requests:
+                  memory: 128Mi
+                limits:
+                  memory: 1Gi

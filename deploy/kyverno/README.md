@@ -66,3 +66,88 @@ and defeat the startup guarantee.
 
 The namespace label is the coarse opt-in. The Pod annotation is the escape
 hatch for jobs or debugging Pods that need direct S3 behavior.
+
+## Mountpoint For S3
+
+Mountpoint CSI Pods are created by the CSI controller in the Mountpoint
+namespace, not in the workload namespace. The Mountpoint policy injects the
+proxy sidecar into selected Mountpoint Pods and leaves ordinary Mountpoint Pods
+alone.
+
+To opt in, label the Mountpoint namespace:
+
+```yaml
+s3-snapshot-proxy.insiderscore.com/mountpoint-inject: "enabled"
+```
+
+The policy follows the Mountpoint Pod annotation
+`s3.csi.aws.com/volume-name` to the PersistentVolume, then follows the PV's
+`claimRef` to the bound PVC. That PVC controls whether the Mountpoint Pod is
+eligible for injection:
+
+```yaml
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  annotations:
+    s3-snapshot-proxy.insiderscore.com/mountpoint-inject: "enabled"
+```
+
+The workload namespace containing that PVC must contain
+`s3-snapshot-proxy-config`. The policy reads this ConfigMap at admission time
+and injects literal environment values into the Mountpoint Pod, even though the
+Mountpoint Pod itself runs in the Mountpoint namespace.
+
+Use a runtime proxy image, not a conformance/test target image. On mixed-node
+clusters, publish it as a multi-platform image covering every node architecture
+that may run Mountpoint Pods.
+
+```yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: s3-snapshot-proxy-config
+  namespace: workload-namespace
+data:
+  IMAGE: example.invalid/s3-snapshot-proxy:runtime
+  AWS_REGION: us-east-1
+  ORIGIN_S3_URL: https://s3.us-east-1.amazonaws.com
+  OVERLAY_S3_URL: https://s3.us-east-1.amazonaws.com
+  OVERLAY_BUCKET: example-overlay-bucket
+  MOUNTPOINT_CREDENTIAL_DISCOVERY_TIMEOUT_SECONDS: "30"
+```
+
+The selected PV must use pod-level credentials and point Mountpoint at the
+local sidecar endpoint, for example:
+
+```yaml
+mountOptions:
+  - region us-east-1
+  - endpoint-url http://127.0.0.1:9000
+  - force-path-style
+csi:
+  driver: s3.csi.aws.com
+  volumeAttributes:
+    authenticationSource: pod
+    bucketName: example-origin-bucket
+```
+
+The sidecar derives the workload web identity token path from the Mountpoint
+Pod UID and volume id under `/comm/credentials`, then reads
+`MountpointS3PodAttachment` to discover the workload role ARN. The included
+RBAC grants read access to that cluster-scoped CR for the default Mountpoint
+service account in `mount-s3`.
+
+Kyverno also needs admission-time read access to PersistentVolumes,
+PersistentVolumeClaims, and ConfigMaps so it can follow the Mountpoint Pod to
+the workload PVC and workload namespace config. The included lookup RBAC binds
+those reads to the default `kyverno/kyverno-admission-controller` service
+account used by the Kyverno Helm chart.
+
+The proxy startup and readiness probes intentionally hit `/health`, not
+`/readyz`, because `/comm/credentials` is populated during mount setup after the
+Mountpoint Pod has started.
+
+Mountpoint Pods are node-affined to the workload node. Keep sidecar resource
+requests conservative; avoid adding a CPU request unless the target nodes have
+enough allocatable slack for every selected Mountpoint mount.
