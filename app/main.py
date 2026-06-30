@@ -6,6 +6,11 @@ from fastapi import FastAPI, Request, Response
 from fastapi.responses import StreamingResponse
 import os
 import argparse
+import json
+import ssl
+import threading
+import time
+import urllib.request
 from urllib.parse import parse_qsl, quote, unquote, urlsplit
 from httpx_auth import AWS4Auth
 from httpx_auth._aws import (
@@ -80,6 +85,185 @@ OVERLAY_S3_URL = os.environ.get("OVERLAY_S3_URL", "http://overlay-s3.local")
 ORIGIN_S3_URL = os.environ.get("ORIGIN_S3_URL", "https://s3.amazonaws.com")
 OVERLAY_BUCKET = os.environ.get("OVERLAY_BUCKET", "overlay")
 
+
+class StaticCredentials:
+    def __init__(self, access_key: str, secret_key: str, token: Optional[str] = None):
+        self.access_key = access_key
+        self.secret_key = secret_key
+        self.token = token
+
+
+class StaticCredentialProvider:
+    def __init__(self, credentials: StaticCredentials):
+        self.credentials = credentials
+
+    def get_credentials(self):
+        return self.credentials
+
+
+class BotoSessionCredentialProvider:
+    def __init__(self):
+        self._session = None
+        self._lock = threading.Lock()
+
+    def reset_session(self):
+        with self._lock:
+            self._session = None
+
+    def get_credentials(self):
+        with self._lock:
+            if self._session is None:
+                self._session = boto3.Session()
+            credentials = self._session.get_credentials()
+
+        if credentials is None:
+            raise RuntimeError("No AWS credentials are available")
+        return credentials.get_frozen_credentials()
+
+
+class MountpointPodCredentialProvider(BotoSessionCredentialProvider):
+    def __init__(self):
+        super().__init__()
+        self._configured = False
+        self._configure_lock = threading.Lock()
+        self.pod_name = os.environ.get("MOUNTPOINT_POD_NAME")
+        self.pod_uid = os.environ.get("MOUNTPOINT_POD_UID")
+        self.volume_id = os.environ.get("MOUNTPOINT_VOLUME_ID")
+        self.credentials_dir = os.environ.get("MOUNTPOINT_CREDENTIALS_DIR", "/comm/credentials")
+        self.discovery_timeout = float(os.environ.get("MOUNTPOINT_CREDENTIAL_DISCOVERY_TIMEOUT_SECONDS", "30"))
+
+    def get_credentials(self):
+        self._ensure_configured()
+        return super().get_credentials()
+
+    def _ensure_configured(self):
+        if self._configured:
+            return
+
+        with self._configure_lock:
+            if self._configured:
+                return
+
+            role_arn = (
+                os.environ.get("AWS_ROLE_ARN")
+                or os.environ.get("MOUNTPOINT_WORKLOAD_ROLE_ARN")
+                or self._discover_workload_role_arn()
+            )
+            token_path = os.environ.get("AWS_WEB_IDENTITY_TOKEN_FILE") or self._web_identity_token_path()
+            self._wait_for_token_file(token_path)
+
+            os.environ["AWS_ROLE_ARN"] = role_arn
+            os.environ["AWS_WEB_IDENTITY_TOKEN_FILE"] = token_path
+            os.environ.setdefault("AWS_EC2_METADATA_DISABLED", "true")
+
+            region = os.environ.get("AWS_REGION") or os.environ.get("AWS_DEFAULT_REGION") or "us-east-1"
+            os.environ.setdefault("AWS_REGION", region)
+            os.environ.setdefault("AWS_DEFAULT_REGION", region)
+
+            self.reset_session()
+            self._configured = True
+            logging.info("Configured Mountpoint pod credentials for role %s", role_arn)
+
+    def _web_identity_token_path(self) -> str:
+        if not self.pod_uid:
+            raise RuntimeError("MOUNTPOINT_POD_UID is required for Mountpoint pod credential discovery")
+        if not self.volume_id:
+            raise RuntimeError("MOUNTPOINT_VOLUME_ID is required for Mountpoint pod credential discovery")
+        return os.path.join(self.credentials_dir, f"{self.pod_uid}-{self.volume_id}.token")
+
+    def _wait_for_token_file(self, token_path: str):
+        deadline = time.monotonic() + self.discovery_timeout
+        while True:
+            if os.path.exists(token_path) and os.path.getsize(token_path) > 0:
+                return
+            if time.monotonic() >= deadline:
+                raise RuntimeError(f"Mountpoint web identity token did not appear at {token_path}")
+            time.sleep(0.25)
+
+    def _discover_workload_role_arn(self) -> str:
+        if not self.pod_name:
+            raise RuntimeError("MOUNTPOINT_POD_NAME is required for Mountpoint pod credential discovery")
+        if not self.volume_id:
+            raise RuntimeError("MOUNTPOINT_VOLUME_ID is required for Mountpoint pod credential discovery")
+
+        deadline = time.monotonic() + self.discovery_timeout
+        last_error = None
+        while True:
+            try:
+                role_arn = self._discover_workload_role_arn_once()
+                if role_arn:
+                    return role_arn
+            except Exception as exc:
+                last_error = exc
+
+            if time.monotonic() >= deadline:
+                if last_error:
+                    raise RuntimeError("Unable to discover Mountpoint workload role ARN") from last_error
+                raise RuntimeError("Unable to discover Mountpoint workload role ARN")
+            time.sleep(0.25)
+
+    def _discover_workload_role_arn_once(self) -> Optional[str]:
+        response = self._kubernetes_api_get_json("/apis/s3.csi.aws.com/v2/mountpoints3podattachments")
+        for item in response.get("items", []):
+            spec = item.get("spec", {})
+            if spec.get("volumeID") != self.volume_id:
+                continue
+            attachments = spec.get("mountpointS3PodAttachments", {})
+            if self.pod_name not in attachments:
+                continue
+            return spec.get("workloadServiceAccountIAMRoleARN")
+        return None
+
+    def _kubernetes_api_get_json(self, path: str) -> dict:
+        host = os.environ.get("KUBERNETES_SERVICE_HOST")
+        if not host:
+            raise RuntimeError("KUBERNETES_SERVICE_HOST is not set")
+        port = os.environ.get("KUBERNETES_SERVICE_PORT_HTTPS") or os.environ.get("KUBERNETES_SERVICE_PORT") or "443"
+        token_path = os.environ.get(
+            "KUBERNETES_SERVICEACCOUNT_TOKEN_FILE",
+            "/var/run/secrets/kubernetes.io/serviceaccount/token",
+        )
+        ca_path = os.environ.get(
+            "KUBERNETES_SERVICEACCOUNT_CA_FILE",
+            "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt",
+        )
+
+        with open(token_path, "r", encoding="utf-8") as token_file:
+            token = token_file.read().strip()
+
+        request = urllib.request.Request(
+            f"https://{host}:{port}{path}",
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Accept": "application/json",
+            },
+        )
+        context = ssl.create_default_context(cafile=ca_path) if os.path.exists(ca_path) else ssl.create_default_context()
+        with urllib.request.urlopen(request, context=context, timeout=5) as response:
+            return json.loads(response.read().decode("utf-8"))
+
+
+def mountpoint_pod_credentials_enabled() -> bool:
+    return os.environ.get("MOUNTPOINT_POD_CREDENTIALS", "").lower() in {"1", "true", "yes", "auto"}
+
+
+default_credential_provider = (
+    MountpointPodCredentialProvider()
+    if mountpoint_pod_credentials_enabled()
+    else BotoSessionCredentialProvider()
+)
+origin_credential_provider = default_credential_provider
+
+overlay_access_key = os.environ.get("OVERLAY_AWS_ACCESS_KEY_ID")
+overlay_secret_key = os.environ.get("OVERLAY_AWS_SECRET_ACCESS_KEY")
+overlay_session_token = os.environ.get("OVERLAY_AWS_SESSION_TOKEN")
+if overlay_access_key and overlay_secret_key:
+    overlay_credential_provider = StaticCredentialProvider(
+        StaticCredentials(overlay_access_key, overlay_secret_key, overlay_session_token)
+    )
+else:
+    overlay_credential_provider = default_credential_provider
+
 # Add health check endpoints for different purposes
 @app.get("/health")
 async def health_check():
@@ -113,14 +297,7 @@ async def readiness_probe():
     
     # Check overlay S3 connection
     try:
-        s3_client_overlay = await run_sync_s3(
-            boto3.client,
-            "s3",
-            aws_access_key_id=overlay_credentials.access_key,
-            aws_secret_access_key=overlay_credentials.secret_key,
-            aws_session_token=overlay_credentials.token if hasattr(overlay_credentials, 'token') else None,
-            endpoint_url=OVERLAY_S3_URL
-        )
+        s3_client_overlay = get_overlay_s3_client()
         # Check if overlay bucket exists
         await run_sync_s3(s3_client_overlay.head_bucket, Bucket=OVERLAY_BUCKET)
         status["components"]["overlay_s3"] = "connected"
@@ -132,14 +309,7 @@ async def readiness_probe():
     # We don't strictly need to check origin S3 if we're just reading from overlay
     # But include a basic check that credentials are valid
     try:
-        s3_client_origin = await run_sync_s3(
-            boto3.client,
-            "s3",
-            aws_access_key_id=origin_credentials.access_key,
-            aws_secret_access_key=origin_credentials.secret_key,
-            aws_session_token=origin_credentials.token if hasattr(origin_credentials, 'token') else None,
-            endpoint_url=ORIGIN_S3_URL
-        )
+        s3_client_origin = get_origin_s3_client()
         # Just check if we can access the service
         await run_sync_s3(s3_client_origin.list_buckets)
         status["components"]["origin_s3"] = "connected"
@@ -161,36 +331,17 @@ async def root():
     """
     return {"status": "healthy"}
 
-# Create a boto3 session (using default configuration)
-session = boto3.Session()
-default_credentials = session.get_credentials()
-
-# For origin requests, always use the default credentials from boto3.
-origin_credentials = default_credentials
-
-# For overlay requests, check if environment variables prefixed with OVERLAY_AWS_ exist.
-overlay_access_key = os.environ.get("OVERLAY_AWS_ACCESS_KEY_ID")
-overlay_secret_key = os.environ.get("OVERLAY_AWS_SECRET_ACCESS_KEY")
-overlay_session_token = os.environ.get("OVERLAY_AWS_SESSION_TOKEN")
-
-if overlay_access_key and overlay_secret_key:
-    # Use overlay credentials from the environment.
-    # We mimic the structure of boto3's credentials by creating an object with access_key, secret_key, and token.
-    class OverlayCredentials:
-        pass
-    overlay_creds = OverlayCredentials()
-    overlay_creds.access_key = overlay_access_key
-    overlay_creds.secret_key = overlay_secret_key
-    overlay_creds.token = overlay_session_token
-    overlay_credentials = overlay_creds
-else:
-    # Fallback to the default boto3 session credentials.
-    overlay_credentials = default_credentials
-
 class S3UnsignedPayloadAWS4Auth(AWS4Auth):
     requires_request_body = False
 
+    def __init__(self, credential_provider, region: str, service: str, include_headers: set[str]):
+        self.credential_provider = credential_provider
+        self.region = region
+        self.service = service
+        self.include_headers = include_headers
+
     def auth_flow(self, request):
+        credentials = self.credential_provider.get_credentials()
         date = datetime_module.datetime.now(datetime_module.timezone.utc)
         request.headers["x-amz-date"] = date.strftime("%Y%m%dT%H%M%SZ")
         payload_hash = request.headers.get("x-amz-content-sha256", "")
@@ -198,8 +349,8 @@ class S3UnsignedPayloadAWS4Auth(AWS4Auth):
             payload_hash = "UNSIGNED-PAYLOAD"
         request.headers["x-amz-content-sha256"] = payload_hash
 
-        if self.security_token:
-            request.headers["x-amz-security-token"] = self.security_token
+        if credentials.token:
+            request.headers["x-amz-security-token"] = credentials.token
 
         canonical_headers, signed_headers = canonical_and_signed_headers(
             request.headers,
@@ -213,7 +364,7 @@ class S3UnsignedPayloadAWS4Auth(AWS4Auth):
         scope = f"{date.strftime('%Y%m%d')}/{self.region}/{self.service}/aws4_request"
         string_to_sign = _string_to_sign(request, canonical_request, scope)
         signing_key = _signing_key(
-            self.secret_key,
+            credentials.secret_key,
             self.region,
             self.service,
             date.strftime("%Y%m%d"),
@@ -225,7 +376,7 @@ class S3UnsignedPayloadAWS4Auth(AWS4Auth):
         ).hexdigest()
 
         auth_str = "AWS4-HMAC-SHA256 "
-        auth_str += f"Credential={self.access_id}/{scope}, "
+        auth_str += f"Credential={credentials.access_key}/{scope}, "
         auth_str += f"SignedHeaders={signed_headers}, "
         auth_str += f"Signature={signature}"
         request.headers["Authorization"] = auth_str
@@ -233,20 +384,16 @@ class S3UnsignedPayloadAWS4Auth(AWS4Auth):
 
 # Build AWS4Auth objects.
 origin_aws_auth = S3UnsignedPayloadAWS4Auth(
-    access_id=origin_credentials.access_key,
-    secret_key=origin_credentials.secret_key,
+    credential_provider=origin_credential_provider,
     region=os.environ.get("AWS_REGION", "us-east-1"),
     service="s3",
-    security_token=origin_credentials.token,
     include_headers=S3_SIGNED_PASSTHROUGH_HEADERS,
 )
 
 overlay_aws_auth = S3UnsignedPayloadAWS4Auth(
-    access_id=overlay_credentials.access_key,
-    secret_key=overlay_credentials.secret_key,
+    credential_provider=overlay_credential_provider,
     region=os.environ.get("AWS_REGION", "us-east-1"),
     service="s3",
-    security_token=overlay_credentials.token,
     include_headers=S3_SIGNED_PASSTHROUGH_HEADERS,
 )
 
@@ -1353,21 +1500,23 @@ def merged_list_to_xml(merged_list, bucket, prefix):
 # Factor out the S3 client creation
 def get_origin_s3_client():
     """Create and return an S3 client for origin access"""
+    credentials = origin_credential_provider.get_credentials()
     return boto3.client(
         "s3",
-        aws_access_key_id=origin_credentials.access_key,
-        aws_secret_access_key=origin_credentials.secret_key,
-        aws_session_token=origin_credentials.token if hasattr(origin_credentials, 'token') else None,
+        aws_access_key_id=credentials.access_key,
+        aws_secret_access_key=credentials.secret_key,
+        aws_session_token=credentials.token,
         endpoint_url=ORIGIN_S3_URL
     )
 
 def get_overlay_s3_client():
     """Create and return an S3 client for overlay access"""
+    credentials = overlay_credential_provider.get_credentials()
     return boto3.client(
         "s3",
-        aws_access_key_id=overlay_credentials.access_key,
-        aws_secret_access_key=overlay_credentials.secret_key,
-        aws_session_token=overlay_credentials.token if hasattr(overlay_credentials, 'token') else None,
+        aws_access_key_id=credentials.access_key,
+        aws_secret_access_key=credentials.secret_key,
+        aws_session_token=credentials.token,
         endpoint_url=OVERLAY_S3_URL
     )
 
