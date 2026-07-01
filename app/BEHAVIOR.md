@@ -56,17 +56,33 @@ Compatible handling of DELETE requests
   are silently ignored. Our proxy should not forward conditional DELETE
   requests and instead return 501.
 
+- Multi-object delete is supported for ordinary object keys by applying the
+  same overlay delete-marker compatibility behavior to each unversioned item
+  in the request. The proxy rewrites virtual keys into the shared overlay
+  bucket, deletes there, and rewrites the returned keys back to the virtual
+  bucket view.
+
+- Version-specific multi-object delete entries are only allowed to mutate
+  versions in the overlay bucket. If the requested version ID exists only in
+  the origin bucket, the proxy returns an item-level AccessDenied error and
+  does not mutate the origin. Conditional multi-object delete fields such as
+  ETag, LastModifiedTime, and Size are not currently implemented.
+
 - For standard versioned buckets on a real Amazon S3 endpoint, the only
   If-None-Match value supported for conditional PUT requests is '*'. The
   value '*' means there must be no already existing non-deleted version
   with the same key.
 
-Handling of ListObjectsV2:
+Handling of ListObjects and ListObjectsV2:
 
-- For a given combination of prefix and delimeter, the proxy will
+- For a given combination of prefix and delimiter, the proxy will
   enumerate all object versions and delete markers from the origin
   bucket which should be visible as of START_TIME, plus any superseding
   objects or delete markers from the overlay bucket.
+
+- Legacy ListObjects uses the same merged snapshot view as ListObjectsV2.
+  It accepts marker-based pagination and returns marker/NextMarker XML
+  fields rather than the v2 continuation-token fields.
 
 - A delete marker for a given key will render all previous versions for
   that same key invisible. 
@@ -82,3 +98,58 @@ Handling of ListObjectsV2:
   return the first (newest) object from the collision. (FIXME: We can
   avoid this problem by hitting the REST endpoint directly and parsing
   the returned XML)
+
+Handling of multipart uploads:
+
+- Object-level multipart upload operations are write-aside operations
+  against the overlay bucket. Initiate, upload part, list parts,
+  complete, and abort requests are forwarded to the overlay object key
+  under the virtual bucket prefix.
+
+- Multipart upload subresources do not fall back to the origin bucket.
+  Upload state exists only in the overlay bucket, and an aborted upload
+  must not create a delete marker.
+
+- Request body checksum and streaming trailer metadata are not forwarded while
+  the proxy decodes aws-chunked upload bodies and re-signs overlay writes.
+  CompleteMultipartUpload per-part checksum elements are stripped before
+  forwarding so the completion request remains consistent with the uploaded
+  overlay parts.
+
+- Bucket-level ListMultipartUploads is served from the overlay bucket with
+  the virtual bucket name applied as an overlay prefix. Returned keys,
+  common prefixes, key markers, and next key markers are rewritten back to
+  the virtual bucket view so in-progress uploads for other virtual buckets
+  in the shared overlay bucket are not exposed.
+
+- CopyObject and UploadPartCopy are intentionally rejected with 501
+  because they require source-object rewriting across the virtual
+  bucket view.
+
+Handling of server-side encryption:
+
+- Explicit SSE-S3 object uploads are passed through to the overlay bucket by
+  forwarding `x-amz-server-side-encryption: AES256`. The overlay backend must
+  be configured to support SSE-S3.
+
+- Explicit KMS key selection and customer-provided encryption keys are not
+  currently forwarded. Default bucket encryption is expected to be transparent
+  when configured directly on origin or overlay buckets, but bucket encryption
+  administration is outside the proxy's support surface.
+
+Handling of object tagging:
+
+- Object tagging operations are passed through to the overlay bucket for objects
+  that already exist in the overlay view. This includes tags supplied during
+  multipart upload initiation.
+
+- GET Object Tagging for objects that exist only in the origin bucket reads
+  tags from the origin version visible at proxy start.
+
+- PUT Object Tagging and DELETE Object Tagging for origin-only objects create a
+  small overlay facilitator object marked with proxy metadata, then store the
+  tag state on that overlay version. Normal GET/HEAD/ListObjectsV2/
+  ListObjectVersions handling hides this facilitator and continues to expose
+  the origin object body and metadata.
+
+- Version-specific tagging requests are not remapped to origin versions.

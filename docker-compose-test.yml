@@ -15,6 +15,9 @@ services:
       - AWS_SECRET_ACCESS_KEY=origin-secret
       - OVERLAY_AWS_ACCESS_KEY_ID=overlay-access
       - OVERLAY_AWS_SECRET_ACCESS_KEY=overlay-secret
+      - PYTHONDONTWRITEBYTECODE=1
+    volumes:
+      - ./app:/app/app:ro
     depends_on:
       origin-populator:
         condition: service_completed_successfully
@@ -37,6 +40,7 @@ services:
     environment:
       MINIO_ACCESS_KEY: overlay-access
       MINIO_SECRET_KEY: overlay-secret
+      MINIO_KMS_SECRET_KEY: "sse-s3-test-key:vwY33RV2+4XYBEjcNkj0xUkg35TXJl7rWdbAOjQ3C0I="
       MINIO_STORAGE_CLASS_STANDARD: EC:0
       MINIO_DISK_USAGE_CRAWL: "off"
     tmpfs:
@@ -96,6 +100,10 @@ services:
     environment:
       - PYTHONPATH=/app
       - SCALE_FACTOR=${SCALE_FACTOR:-100}
+      - PYTHONDONTWRITEBYTECODE=1
+    volumes:
+      - ./app:/app/app:ro
+      - ./tests:/app/tests:ro
     entrypoint: "python /app/tests/populate_origin.py"
 
   test-runner:
@@ -106,4 +114,299 @@ services:
       s3proxy:
         condition: service_healthy
     working_dir: /app/tests
+    environment:
+      - PYTHONDONTWRITEBYTECODE=1
+      - PYTEST_ADDOPTS=-p no:cacheprovider
+    volumes:
+      - ./app:/app/app:ro
+      - ./tests:/app/tests:ro
     entrypoint: "pytest test_regression.py --disable-warnings --capture=no --scale-factor=100"
+
+  conformance-runner:
+    profiles:
+      - conformance
+    build:
+      context: .
+      target: conformance
+    depends_on:
+      s3proxy:
+        condition: service_healthy
+    working_dir: /app
+    environment:
+      - CONFORMANCE_PROXY_HOST=s3proxy
+      - CONFORMANCE_PROXY_PORT=9000
+      - CONFORMANCE_ORIGIN_ENDPOINT=http://minio-origin:9000
+      - CONFORMANCE_OVERLAY_ENDPOINT=http://minio-overlay:9000
+      - CONFORMANCE_OVERLAY_BUCKET=overlay
+      - CONFORMANCE_MAIN_ACCESS_KEY=origin-access
+      - CONFORMANCE_MAIN_SECRET_KEY=origin-secret
+      - CONFORMANCE_ORIGIN_ACCESS_KEY=origin-access
+      - CONFORMANCE_ORIGIN_SECRET_KEY=origin-secret
+      - CONFORMANCE_OVERLAY_ACCESS_KEY=overlay-access
+      - CONFORMANCE_OVERLAY_SECRET_KEY=overlay-secret
+      - CONFORMANCE_ARTIFACT_DIR=/app/tests/conformance/artifacts
+      - CONFORMANCE_ADVISORY=${CONFORMANCE_ADVISORY:-true}
+      - S3TESTS_ROOT=/opt/s3-tests
+      - PYTHONDONTWRITEBYTECODE=1
+      - PYTEST_ADDOPTS=-p no:cacheprovider
+    volumes:
+      - ./app:/app/app:ro
+      - ./tests:/app/tests:ro
+      - ./tests/conformance/artifacts:/app/tests/conformance/artifacts
+
+  iceberg-postgres:
+    profiles:
+      - iceberg
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: iceberg
+      POSTGRES_USER: iceberg
+      POSTGRES_PASSWORD: iceberg
+    tmpfs:
+      - /var/lib/postgresql/data:size=512m
+    volumes:
+      - ./tests/iceberg/init_jdbc_catalog.sql:/docker-entrypoint-initdb.d/init_jdbc_catalog.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U iceberg -d iceberg"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+
+  iceberg-buckets-init:
+    profiles:
+      - iceberg
+    image: minio/mc
+    depends_on:
+      minio-origin:
+        condition: service_healthy
+      minio-overlay:
+        condition: service_healthy
+    volumes:
+      - ./tests/iceberg/init_iceberg_buckets.sh:/app/tests/iceberg/init_iceberg_buckets.sh:ro
+    entrypoint: "sh /app/tests/iceberg/init_iceberg_buckets.sh"
+
+  trino-iceberg:
+    profiles:
+      - iceberg
+    image: trinodb/trino:481
+    depends_on:
+      iceberg-postgres:
+        condition: service_healthy
+      iceberg-buckets-init:
+        condition: service_completed_successfully
+    volumes:
+      - ./tests/iceberg/trino/catalog:/etc/trino/catalog:ro
+
+  iceberg-origin-bootstrap:
+    profiles:
+      - iceberg
+    image: s3-snapshot-proxy-iceberg-spark
+    build:
+      context: .
+      dockerfile: tests/iceberg/Dockerfile
+    depends_on:
+      iceberg-buckets-init:
+        condition: service_completed_successfully
+    working_dir: /app
+    environment:
+      - AWS_ACCESS_KEY_ID=origin-access
+      - AWS_SECRET_ACCESS_KEY=origin-secret
+    volumes:
+      - ./tests:/app/tests:ro
+    entrypoint: "python /app/tests/iceberg/spark_hadoop_workload.py bootstrap --endpoint http://minio-origin:9000"
+
+  iceberg-origin-mutator:
+    profiles:
+      - iceberg
+    image: s3-snapshot-proxy-iceberg-spark
+    build:
+      context: .
+      dockerfile: tests/iceberg/Dockerfile
+    depends_on:
+      iceberg-origin-bootstrap:
+        condition: service_completed_successfully
+    working_dir: /app
+    environment:
+      - AWS_ACCESS_KEY_ID=origin-access
+      - AWS_SECRET_ACCESS_KEY=origin-secret
+      - ICEBERG_MUTATION_SECONDS=${ICEBERG_MUTATION_SECONDS:-75}
+    volumes:
+      - ./tests:/app/tests:ro
+    entrypoint: "python /app/tests/iceberg/spark_hadoop_workload.py mutate-origin --endpoint http://minio-origin:9000"
+
+  s3proxy-iceberg-a:
+    profiles:
+      - iceberg
+    build:
+      context: .
+      target: base
+    environment:
+      - OVERLAY_S3_URL=http://minio-overlay:9000
+      - OVERLAY_BUCKET=iceberg-overlay-a
+      - ORIGIN_S3_URL=http://minio-origin:9000
+      - AWS_ACCESS_KEY_ID=origin-access
+      - AWS_SECRET_ACCESS_KEY=origin-secret
+      - OVERLAY_AWS_ACCESS_KEY_ID=overlay-access
+      - OVERLAY_AWS_SECRET_ACCESS_KEY=overlay-secret
+      - PYTHONDONTWRITEBYTECODE=1
+    volumes:
+      - ./app:/app/app:ro
+    depends_on:
+      iceberg-origin-bootstrap:
+        condition: service_completed_successfully
+      iceberg-buckets-init:
+        condition: service_completed_successfully
+    entrypoint: "uvicorn app.main:app --host 0.0.0.0 --port 9000 --log-level info"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/health"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+      start_period: 2s
+
+  s3proxy-iceberg-b:
+    profiles:
+      - iceberg
+    build:
+      context: .
+      target: base
+    environment:
+      - OVERLAY_S3_URL=http://minio-overlay:9000
+      - OVERLAY_BUCKET=iceberg-overlay-b
+      - ORIGIN_S3_URL=http://minio-origin:9000
+      - AWS_ACCESS_KEY_ID=origin-access
+      - AWS_SECRET_ACCESS_KEY=origin-secret
+      - OVERLAY_AWS_ACCESS_KEY_ID=overlay-access
+      - OVERLAY_AWS_SECRET_ACCESS_KEY=overlay-secret
+      - PYTHONDONTWRITEBYTECODE=1
+    volumes:
+      - ./app:/app/app:ro
+    depends_on:
+      iceberg-origin-bootstrap:
+        condition: service_completed_successfully
+      iceberg-buckets-init:
+        condition: service_completed_successfully
+    entrypoint: "sh -c 'sleep 8; uvicorn app.main:app --host 0.0.0.0 --port 9000 --log-level info'"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/health"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+      start_period: 10s
+
+  s3proxy-iceberg-c:
+    profiles:
+      - iceberg
+    build:
+      context: .
+      target: base
+    environment:
+      - OVERLAY_S3_URL=http://minio-overlay:9000
+      - OVERLAY_BUCKET=iceberg-overlay-c
+      - ORIGIN_S3_URL=http://minio-origin:9000
+      - AWS_ACCESS_KEY_ID=origin-access
+      - AWS_SECRET_ACCESS_KEY=origin-secret
+      - OVERLAY_AWS_ACCESS_KEY_ID=overlay-access
+      - OVERLAY_AWS_SECRET_ACCESS_KEY=overlay-secret
+      - PYTHONDONTWRITEBYTECODE=1
+    volumes:
+      - ./app:/app/app:ro
+    depends_on:
+      iceberg-origin-bootstrap:
+        condition: service_completed_successfully
+      iceberg-buckets-init:
+        condition: service_completed_successfully
+    entrypoint: "sh -c 'sleep 16; uvicorn app.main:app --host 0.0.0.0 --port 9000 --log-level info'"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/health"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+      start_period: 18s
+
+  iceberg-snapshot-workload-a:
+    profiles:
+      - iceberg
+    image: s3-snapshot-proxy-iceberg-spark
+    build:
+      context: .
+      dockerfile: tests/iceberg/Dockerfile
+    depends_on:
+      iceberg-origin-mutator:
+        condition: service_started
+      s3proxy-iceberg-a:
+        condition: service_healthy
+    working_dir: /app
+    environment:
+      - AWS_ACCESS_KEY_ID=origin-access
+      - AWS_SECRET_ACCESS_KEY=origin-secret
+    volumes:
+      - ./tests:/app/tests:ro
+    entrypoint: "python /app/tests/iceberg/spark_hadoop_workload.py snapshot-workload --endpoint http://s3proxy-iceberg-a:9000 --catalog snap_a --batch 9000"
+
+  iceberg-snapshot-workload-b:
+    profiles:
+      - iceberg
+    image: s3-snapshot-proxy-iceberg-spark
+    build:
+      context: .
+      dockerfile: tests/iceberg/Dockerfile
+    depends_on:
+      iceberg-origin-mutator:
+        condition: service_started
+      s3proxy-iceberg-b:
+        condition: service_healthy
+    working_dir: /app
+    environment:
+      - AWS_ACCESS_KEY_ID=origin-access
+      - AWS_SECRET_ACCESS_KEY=origin-secret
+    volumes:
+      - ./tests:/app/tests:ro
+    entrypoint: "python /app/tests/iceberg/spark_hadoop_workload.py snapshot-workload --endpoint http://s3proxy-iceberg-b:9000 --catalog snap_b --batch 9001"
+
+  iceberg-snapshot-workload-c:
+    profiles:
+      - iceberg
+    image: s3-snapshot-proxy-iceberg-spark
+    build:
+      context: .
+      dockerfile: tests/iceberg/Dockerfile
+    depends_on:
+      iceberg-origin-mutator:
+        condition: service_started
+      s3proxy-iceberg-c:
+        condition: service_healthy
+    working_dir: /app
+    environment:
+      - AWS_ACCESS_KEY_ID=origin-access
+      - AWS_SECRET_ACCESS_KEY=origin-secret
+    volumes:
+      - ./tests:/app/tests:ro
+    entrypoint: "python /app/tests/iceberg/spark_hadoop_workload.py snapshot-workload --endpoint http://s3proxy-iceberg-c:9000 --catalog snap_c --batch 9002"
+
+  iceberg-workload-runner:
+    profiles:
+      - iceberg
+    build:
+      context: .
+      target: test
+    depends_on:
+      iceberg-snapshot-workload-a:
+        condition: service_completed_successfully
+      iceberg-snapshot-workload-b:
+        condition: service_completed_successfully
+      iceberg-snapshot-workload-c:
+        condition: service_completed_successfully
+      trino-iceberg:
+        condition: service_started
+    working_dir: /app/tests
+    environment:
+      - PYTHONPATH=/app/tests/iceberg:/app
+      - TRINO_HOST=trino-iceberg
+      - ICEBERG_ORIGIN_ENDPOINT=http://minio-origin:9000
+      - PYTHONDONTWRITEBYTECODE=1
+      - PYTEST_ADDOPTS=-p no:cacheprovider
+    volumes:
+      - ./app:/app/app:ro
+      - ./tests:/app/tests:ro
+    entrypoint: "pytest /app/tests/iceberg/test_trino_iceberg_workloads.py --disable-warnings --capture=no"

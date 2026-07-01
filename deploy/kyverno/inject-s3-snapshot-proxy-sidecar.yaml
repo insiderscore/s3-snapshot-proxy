@@ -1,0 +1,210 @@
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: inject-s3-snapshot-proxy-sidecar
+  annotations:
+    pod-policies.kyverno.io/autogen-controllers: "none"
+spec:
+  background: false
+  rules:
+    - name: add-proxy-sidecar-no-initcontainers
+      match:
+        any:
+          - resources:
+              kinds:
+                - Pod
+              operations:
+                - CREATE
+              namespaceSelector:
+                matchLabels:
+                  s3-snapshot-proxy.insiderscore.com/inject: "enabled"
+      context:
+        - name: proxyConfig
+          configMap:
+            name: s3-snapshot-proxy-config
+            namespace: "{{ request.namespace }}"
+      preconditions:
+        all:
+          - key: "{{ request.object.metadata.annotations.\"s3-snapshot-proxy.insiderscore.com/inject\" || '' }}"
+            operator: NotEquals
+            value: "disabled"
+          - key: "{{ request.object.spec.hostNetwork || `false` }}"
+            operator: Equals
+            value: false
+          - key: "{{ length(request.object.spec.containers[?name == 's3-snapshot-proxy']) }}"
+            operator: Equals
+            value: 0
+          - key: "{{ length(request.object.spec.initContainers[?name == 's3-snapshot-proxy'] || `[]`) }}"
+            operator: Equals
+            value: 0
+          - key: "{{ length(request.object.spec.initContainers || `[]`) }}"
+            operator: Equals
+            value: 0
+      mutate:
+        patchesJson6902: |-
+          - op: add
+            path: /spec/initContainers
+            value:
+              - name: s3-snapshot-proxy
+                image: "{{ proxyConfig.data.IMAGE }}"
+                imagePullPolicy: IfNotPresent
+                restartPolicy: Always
+                env:
+                  - name: AWS_REGION
+                    valueFrom:
+                      configMapKeyRef:
+                        name: s3-snapshot-proxy-config
+                        key: AWS_REGION
+                  - name: AWS_EC2_METADATA_DISABLED
+                    value: "true"
+                  - name: ORIGIN_S3_URL
+                    valueFrom:
+                      configMapKeyRef:
+                        name: s3-snapshot-proxy-config
+                        key: ORIGIN_S3_URL
+                        optional: true
+                  - name: OVERLAY_S3_URL
+                    valueFrom:
+                      configMapKeyRef:
+                        name: s3-snapshot-proxy-config
+                        key: OVERLAY_S3_URL
+                        optional: true
+                  - name: OVERLAY_BUCKET
+                    valueFrom:
+                      configMapKeyRef:
+                        name: s3-snapshot-proxy-config
+                        key: OVERLAY_BUCKET
+                  - name: MAX_CONTROL_BODY_BYTES
+                    valueFrom:
+                      configMapKeyRef:
+                        name: s3-snapshot-proxy-config
+                        key: MAX_CONTROL_BODY_BYTES
+                        optional: true
+                ports:
+                  - name: s3-proxy
+                    containerPort: 9000
+                startupProbe:
+                  httpGet:
+                    path: /health
+                    port: s3-proxy
+                  periodSeconds: 2
+                  failureThreshold: 30
+                readinessProbe:
+                  httpGet:
+                    path: /health
+                    port: s3-proxy
+                  periodSeconds: 5
+                  failureThreshold: 3
+                livenessProbe:
+                  httpGet:
+                    path: /livez
+                    port: s3-proxy
+                  periodSeconds: 20
+                  failureThreshold: 3
+                resources:
+                  requests:
+                    cpu: 100m
+                    memory: 256Mi
+                  limits:
+                    memory: 1Gi
+
+    - name: prepend-proxy-sidecar-before-initcontainers
+      match:
+        any:
+          - resources:
+              kinds:
+                - Pod
+              operations:
+                - CREATE
+              namespaceSelector:
+                matchLabels:
+                  s3-snapshot-proxy.insiderscore.com/inject: "enabled"
+      context:
+        - name: proxyConfig
+          configMap:
+            name: s3-snapshot-proxy-config
+            namespace: "{{ request.namespace }}"
+      preconditions:
+        all:
+          - key: "{{ request.object.metadata.annotations.\"s3-snapshot-proxy.insiderscore.com/inject\" || '' }}"
+            operator: NotEquals
+            value: "disabled"
+          - key: "{{ request.object.spec.hostNetwork || `false` }}"
+            operator: Equals
+            value: false
+          - key: "{{ length(request.object.spec.containers[?name == 's3-snapshot-proxy']) }}"
+            operator: Equals
+            value: 0
+          - key: "{{ length(request.object.spec.initContainers[?name == 's3-snapshot-proxy'] || `[]`) }}"
+            operator: Equals
+            value: 0
+          - key: "{{ length(request.object.spec.initContainers || `[]`) }}"
+            operator: GreaterThan
+            value: 0
+      mutate:
+        patchesJson6902: |-
+          - op: add
+            path: /spec/initContainers/0
+            value:
+              name: s3-snapshot-proxy
+              image: "{{ proxyConfig.data.IMAGE }}"
+              imagePullPolicy: IfNotPresent
+              restartPolicy: Always
+              env:
+                - name: AWS_REGION
+                  valueFrom:
+                    configMapKeyRef:
+                      name: s3-snapshot-proxy-config
+                      key: AWS_REGION
+                - name: AWS_EC2_METADATA_DISABLED
+                  value: "true"
+                - name: ORIGIN_S3_URL
+                  valueFrom:
+                    configMapKeyRef:
+                      name: s3-snapshot-proxy-config
+                      key: ORIGIN_S3_URL
+                      optional: true
+                - name: OVERLAY_S3_URL
+                  valueFrom:
+                    configMapKeyRef:
+                      name: s3-snapshot-proxy-config
+                      key: OVERLAY_S3_URL
+                      optional: true
+                - name: OVERLAY_BUCKET
+                  valueFrom:
+                    configMapKeyRef:
+                      name: s3-snapshot-proxy-config
+                      key: OVERLAY_BUCKET
+                - name: MAX_CONTROL_BODY_BYTES
+                  valueFrom:
+                    configMapKeyRef:
+                      name: s3-snapshot-proxy-config
+                      key: MAX_CONTROL_BODY_BYTES
+                      optional: true
+              ports:
+                - name: s3-proxy
+                  containerPort: 9000
+              startupProbe:
+                httpGet:
+                  path: /health
+                  port: s3-proxy
+                periodSeconds: 2
+                failureThreshold: 30
+              readinessProbe:
+                httpGet:
+                  path: /health
+                  port: s3-proxy
+                periodSeconds: 5
+                failureThreshold: 3
+              livenessProbe:
+                httpGet:
+                  path: /livez
+                  port: s3-proxy
+                periodSeconds: 20
+                failureThreshold: 3
+              resources:
+                requests:
+                  cpu: 100m
+                  memory: 256Mi
+                limits:
+                  memory: 1Gi

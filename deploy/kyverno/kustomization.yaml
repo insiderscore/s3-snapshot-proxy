@@ -1,0 +1,8 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - inject-s3-snapshot-proxy-sidecar.yaml
+  - inject-s3-snapshot-proxy-env.yaml
+  - inject-s3-snapshot-proxy-mountpoint-sidecar.yaml
+  - kyverno-mountpoint-lookup-rbac.yaml
+  - mountpoint-s3podattachment-reader-rbac.yaml
