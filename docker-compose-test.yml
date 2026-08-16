@@ -157,7 +157,7 @@ services:
   iceberg-postgres:
     profiles:
       - iceberg
-    image: postgres:16-alpine
+    image: postgres:16-alpine@sha256:cf78e76683b9ca8c5733cbbdce6c9262b45b6767934dd0a95e671f9a0fc20685
     environment:
       POSTGRES_DB: iceberg
       POSTGRES_USER: iceberg
@@ -175,7 +175,7 @@ services:
   iceberg-buckets-init:
     profiles:
       - iceberg
-    image: minio/mc
+    image: minio/mc@sha256:a7fe349ef4bd8521fb8497f55c6042871b2ae640607cf99d9bede5e9bdf11727
     depends_on:
       minio-origin:
         condition: service_healthy
@@ -188,7 +188,7 @@ services:
   trino-iceberg:
     profiles:
       - iceberg
-    image: trinodb/trino:481
+    image: trinodb/trino:481@sha256:5b5e0a97f599a30a2e23c7c7061e4e4d546a914b4fad2a2a002998140ceb4006
     depends_on:
       iceberg-postgres:
         condition: service_healthy
