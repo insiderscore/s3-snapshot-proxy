@@ -2898,15 +2898,22 @@ async def proxy(full_path: str, request: Request):
     query_string = request.url.query
     original_headers = dict(request.headers)
     multipart_subresource = is_multipart_upload_subresource(query_string)
+    multi_object_delete = (
+        method == "POST"
+        and query_has_param(query_string, "delete")
+    )
     logging.info("Received %s request for %s", method, full_path)
 
-    if request_mutates_reserved_namespace(method, full_path):
+    if (
+        request_mutates_reserved_namespace(method, full_path)
+        and not multi_object_delete
+    ):
         return await finalize_early_body_response(
             request,
             reserved_namespace_mutation_response(),
         )
 
-    if method == "POST" and query_has_param(query_string, "delete"):
+    if multi_object_delete:
         try:
             body = await read_control_body(request)
         except ControlBodyTooLarge:

@@ -17,7 +17,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from app import main, snapshot_time
 
 
-def request_for(method: str, full_path: str, body: bytes = b"") -> Request:
+def request_for(
+    method: str,
+    full_path: str,
+    body: bytes = b"",
+    query_string: str = "",
+) -> Request:
     delivered = False
 
     async def receive():
@@ -36,7 +41,7 @@ def request_for(method: str, full_path: str, body: bytes = b"") -> Request:
             "scheme": "http",
             "path": f"/{full_path}",
             "raw_path": f"/{full_path}".encode(),
-            "query_string": b"",
+            "query_string": query_string.encode(),
             "headers": [(b"content-length", str(len(body)).encode())],
             "client": ("test", 1234),
             "server": ("proxy", 9000),
@@ -80,7 +85,17 @@ def test_reserved_namespace_check_uses_the_overlay_key():
     )
 
 
-def test_multi_object_delete_denies_reserved_entries(monkeypatch):
+@pytest.mark.parametrize(
+    "full_path",
+    [
+        snapshot_time.RESERVED_NAMESPACE.rstrip("/"),
+        snapshot_time.RESERVED_NAMESPACE,
+    ],
+)
+def test_multi_object_delete_denies_reserved_entries_at_request_boundary(
+    monkeypatch,
+    full_path,
+):
     class NoMutationClient:
         def put_object(self, **kwargs):
             raise AssertionError(f"unexpected put_object: {kwargs}")
@@ -100,10 +115,13 @@ def test_multi_object_delete_denies_reserved_entries(monkeypatch):
     </Delete>
     """
 
-    response = main._handle_multi_object_delete_request_sync(
-        snapshot_time.RESERVED_NAMESPACE.rstrip("/"),
+    request = request_for(
+        "POST",
+        full_path,
         body,
+        query_string="delete",
     )
+    response = asyncio.run(main.proxy(full_path, request))
 
     assert response.status_code == 200
     root = ET.fromstring(response.body)
