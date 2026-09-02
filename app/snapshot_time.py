@@ -4,11 +4,16 @@ from typing import Optional
 import botocore.exceptions
 
 
-SNAPSHOT_TIME_OBJECT_KEY = "__s3_snapshot_proxy__/snapshot-time"
+RESERVED_NAMESPACE = "__s3_snapshot_proxy__/"
+SNAPSHOT_TIME_OBJECT_KEY = f"{RESERVED_NAMESPACE}snapshot-time"
 
 
 class SnapshotTimeError(RuntimeError):
     pass
+
+
+def overlay_key_is_reserved(key: str) -> bool:
+    return key.startswith(RESERVED_NAMESPACE)
 
 
 def parse_snapshot_time(value: str, source: str) -> datetime:

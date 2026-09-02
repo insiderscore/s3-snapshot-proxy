@@ -64,6 +64,11 @@ Handling of snapshot time persistence:
 - The `--require-existing-snapshot-time` command line option causes startup to
   exit nonzero if the snapshot time object does not already exist.
 
+- Object keys in the overlay bucket beneath `__s3_snapshot_proxy__/` are
+  reserved for proxy use. Client PUT, POST, and DELETE requests against this
+  namespace return AccessDenied. Multi-object delete reports AccessDenied for
+  each reserved entry without modifying it.
+
 Compatible handling of DELETE requests
 
 - When running against a real Amazon S3 endpoint, a delete marker will

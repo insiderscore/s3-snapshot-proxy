@@ -79,6 +79,9 @@ LEGACY_DELETE_MARKER_FACILITATOR_ETAG = '"' + hashlib.md5(b"").hexdigest() + '"'
 TAG_FACILITATOR_METADATA = "s3-snapshot-proxy-tag-facilitator"
 TAG_FACILITATOR_BODY = b"s3-snapshot-proxy tag facilitator\n"
 TAG_FACILITATOR_ETAG = '"' + hashlib.md5(TAG_FACILITATOR_BODY).hexdigest() + '"'
+RESERVED_NAMESPACE_MUTATION_MESSAGE = (
+    f"The {snapshot_time.RESERVED_NAMESPACE} namespace is reserved for proxy use"
+)
 MAX_CONTROL_BODY_BYTES = int(os.environ.get("MAX_CONTROL_BODY_BYTES", str(10 * 1024 * 1024)))
 S3_SIGNED_PASSTHROUGH_HEADERS = {
     "cache-control",
@@ -581,6 +584,19 @@ def split_bucket_key(path: str) -> tuple[str, str]:
     if len(parts) == 2:
         return parts[0], parts[1]
     return parts[0], ""
+
+def request_mutates_reserved_namespace(method: str, full_path: str) -> bool:
+    return (
+        method in {"PUT", "POST", "DELETE"}
+        and snapshot_time.overlay_key_is_reserved(full_path.lstrip("/"))
+    )
+
+def reserved_namespace_mutation_response() -> Response:
+    return s3_error_response(
+        "AccessDenied",
+        RESERVED_NAMESPACE_MUTATION_MESSAGE,
+        403,
+    )
 
 def append_query(url: str, query_string: str) -> str:
     if query_string:
@@ -1189,6 +1205,14 @@ def _handle_multi_object_delete_request_sync(full_path: str, body: bytes) -> Res
 
     for item in parsed["Objects"]:
         overlay_key = f"{bucket}/{item['Key']}"
+
+        if snapshot_time.overlay_key_is_reserved(overlay_key):
+            errors.append(delete_objects_item_error(
+                item,
+                "AccessDenied",
+                RESERVED_NAMESPACE_MUTATION_MESSAGE,
+            ))
+            continue
 
         if item["Conditions"]:
             errors.append(delete_objects_item_error(
@@ -2875,6 +2899,12 @@ async def proxy(full_path: str, request: Request):
     original_headers = dict(request.headers)
     multipart_subresource = is_multipart_upload_subresource(query_string)
     logging.info("Received %s request for %s", method, full_path)
+
+    if request_mutates_reserved_namespace(method, full_path):
+        return await finalize_early_body_response(
+            request,
+            reserved_namespace_mutation_response(),
+        )
 
     if method == "POST" and query_has_param(query_string, "delete"):
         try:
