@@ -1,5 +1,6 @@
 import datetime as datetime_module
 import asyncio
+from contextlib import asynccontextmanager
 import hmac
 import httpx
 from fastapi import FastAPI, Request, Response
@@ -27,6 +28,8 @@ from typing import AsyncIterator, Optional
 import botocore.exceptions
 import hashlib
 
+from app import snapshot_time
+
 async def run_sync_s3(func, *args, **kwargs):
     return await asyncio.to_thread(func, *args, **kwargs)
 
@@ -37,30 +40,37 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)s %(name)s %(message)s"
 )
 
-# Determine START_TIME from environment variable instead of command line
-start_time_str = os.environ.get("START_TIME")
-if start_time_str:
-    try:
-        # Parse the provided start time
-        START_TIME = datetime.fromisoformat(start_time_str.replace('Z', '+00:00'))
-        
-        # Check if time is in the future
-        if START_TIME > datetime.now(timezone.utc):
-            logging.error("Error: Cannot set START_TIME in the future.")
-            logging.error("DMC-12 unavailable. Attempt with Cybertruck failed. (snapshot start time must be in the past.)")
-            sys.exit(1)
-            
-        logging.info(f"Using custom START_TIME: {START_TIME.isoformat()}")
-    except ValueError as e:
-        logging.error(f"Invalid START_TIME format. Please use ISO-8601 format (YYYY-MM-DDTHH:MM:SSZ).")
-        logging.error(f"Error: {e}")
-        sys.exit(1)
-else:
-    # Use current time if no START_TIME provided
-    START_TIME = datetime.now(timezone.utc)
-    logging.info(f"Using current time as START_TIME: {START_TIME.isoformat()}")
 
-app = FastAPI()
+start_time_str = os.environ.get("START_TIME")
+try:
+    CONFIGURED_START_TIME = (
+        snapshot_time.parse_snapshot_time(start_time_str, "START_TIME")
+        if start_time_str
+        else None
+    )
+except ValueError as exc:
+    logging.error("%s", exc)
+    sys.exit(1)
+
+START_TIME = CONFIGURED_START_TIME
+REQUIRE_EXISTING_SNAPSHOT_TIME = False
+
+
+@asynccontextmanager
+async def app_lifespan(_app: FastAPI):
+    global START_TIME
+    START_TIME = await run_sync_s3(
+        snapshot_time.initialize_snapshot_time,
+        get_overlay_s3_client(),
+        OVERLAY_BUCKET,
+        CONFIGURED_START_TIME,
+        REQUIRE_EXISTING_SNAPSHOT_TIME,
+    )
+    logging.info("Using snapshot time: %s", START_TIME.isoformat())
+    yield
+
+
+app = FastAPI(lifespan=app_lifespan)
 
 DELETE_MARKER_FACILITATOR_METADATA = "s3-snapshot-proxy-delete-marker-facilitator"
 DELETE_MARKER_FACILITATOR_BODY = b"s3-snapshot-proxy delete marker facilitator\n"
@@ -69,6 +79,9 @@ LEGACY_DELETE_MARKER_FACILITATOR_ETAG = '"' + hashlib.md5(b"").hexdigest() + '"'
 TAG_FACILITATOR_METADATA = "s3-snapshot-proxy-tag-facilitator"
 TAG_FACILITATOR_BODY = b"s3-snapshot-proxy tag facilitator\n"
 TAG_FACILITATOR_ETAG = '"' + hashlib.md5(TAG_FACILITATOR_BODY).hexdigest() + '"'
+RESERVED_NAMESPACE_MUTATION_MESSAGE = (
+    f"The {snapshot_time.RESERVED_NAMESPACE} namespace is reserved for proxy use"
+)
 MAX_CONTROL_BODY_BYTES = int(os.environ.get("MAX_CONTROL_BODY_BYTES", str(10 * 1024 * 1024)))
 S3_SIGNED_PASSTHROUGH_HEADERS = {
     "cache-control",
@@ -571,6 +584,19 @@ def split_bucket_key(path: str) -> tuple[str, str]:
     if len(parts) == 2:
         return parts[0], parts[1]
     return parts[0], ""
+
+def request_mutates_reserved_namespace(method: str, full_path: str) -> bool:
+    return (
+        method in {"PUT", "POST", "DELETE"}
+        and snapshot_time.overlay_key_is_reserved(full_path.lstrip("/"))
+    )
+
+def reserved_namespace_mutation_response() -> Response:
+    return s3_error_response(
+        "AccessDenied",
+        RESERVED_NAMESPACE_MUTATION_MESSAGE,
+        403,
+    )
 
 def append_query(url: str, query_string: str) -> str:
     if query_string:
@@ -1180,6 +1206,14 @@ def _handle_multi_object_delete_request_sync(full_path: str, body: bytes) -> Res
     for item in parsed["Objects"]:
         overlay_key = f"{bucket}/{item['Key']}"
 
+        if snapshot_time.overlay_key_is_reserved(overlay_key):
+            errors.append(delete_objects_item_error(
+                item,
+                "AccessDenied",
+                RESERVED_NAMESPACE_MUTATION_MESSAGE,
+            ))
+            continue
+
         if item["Conditions"]:
             errors.append(delete_objects_item_error(
                 item,
@@ -1519,6 +1553,7 @@ def get_overlay_s3_client():
         aws_session_token=credentials.token,
         endpoint_url=OVERLAY_S3_URL
     )
+
 
 # Extract version filtering into a utility function
 def filter_version_by_start_time(version, start_time):
@@ -2863,9 +2898,22 @@ async def proxy(full_path: str, request: Request):
     query_string = request.url.query
     original_headers = dict(request.headers)
     multipart_subresource = is_multipart_upload_subresource(query_string)
+    multi_object_delete = (
+        method == "POST"
+        and query_has_param(query_string, "delete")
+    )
     logging.info("Received %s request for %s", method, full_path)
 
-    if method == "POST" and query_has_param(query_string, "delete"):
+    if (
+        request_mutates_reserved_namespace(method, full_path)
+        and not multi_object_delete
+    ):
+        return await finalize_early_body_response(
+            request,
+            reserved_namespace_mutation_response(),
+        )
+
+    if multi_object_delete:
         try:
             body = await read_control_body(request)
         except ControlBodyTooLarge:
@@ -3006,3 +3054,38 @@ async def proxy(full_path: str, request: Request):
             return s3_error_response("InvalidRequest", str(exc), 400)
         logging.info("Overlay response status: %s, headers: %s", response.status_code, dict(response.headers))
         return streaming_response_from_httpx(response)
+
+
+def build_argument_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="S3 snapshot proxy")
+    parser.add_argument("--host", default="0.0.0.0")
+    parser.add_argument("--port", type=int, default=9000)
+    parser.add_argument("--log-level", default="info")
+    parser.add_argument(
+        "--require-existing-snapshot-time",
+        action="store_true",
+        help=(
+            "Exit during startup unless the overlay bucket already contains "
+            "the snapshot time object"
+        ),
+    )
+    return parser
+
+
+def cli_main(argv=None):
+    global REQUIRE_EXISTING_SNAPSHOT_TIME
+    args = build_argument_parser().parse_args(argv)
+    REQUIRE_EXISTING_SNAPSHOT_TIME = args.require_existing_snapshot_time
+
+    import uvicorn
+
+    uvicorn.run(
+        app,
+        host=args.host,
+        port=args.port,
+        log_level=args.log_level,
+    )
+
+
+if __name__ == "__main__":
+    cli_main()

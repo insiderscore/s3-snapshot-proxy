@@ -24,7 +24,8 @@ Pre-requisites:
 
 - The origin buckets and the overlay bucket must have versioning enabled.
 
-- The overlay bucket must not contain objects created before START_TIME
+- Except for the reserved `__s3_snapshot_proxy__/snapshot-time` coordination
+  object, the overlay bucket must not contain objects created before START_TIME.
 
 - The client must sign requests to the proxy with credentials which
   would allow it to make read-only requests to the origin buckets. The
@@ -40,6 +41,33 @@ Pre-requisites:
 - The proxy itself must have full read/write access to an overlay
   bucket, which it uses to store updated versions of objects including
   delete markers
+
+Handling of snapshot time persistence:
+
+- The proxy records START_TIME in the overlay bucket as
+  `__s3_snapshot_proxy__/snapshot-time`.
+
+- On startup, the proxy reuses the timestamp in this object when START_TIME is
+  not specified.
+
+- If START_TIME is specified and the object does not exist, the proxy creates
+  it using the specified timestamp. If the object already contains a different
+  timestamp, startup fails rather than changing the snapshot represented by
+  existing overlay data.
+
+- If neither START_TIME nor an existing snapshot time object is available, the
+  proxy uses the current time and creates the object with `If-None-Match: *`.
+  If another creator wins, the conditional PUT returns 412. A 409 conflict is
+  retried. After the PUT succeeds or loses to another creator, the proxy reads
+  the object back and uses the stored value.
+
+- The `--require-existing-snapshot-time` command line option causes startup to
+  exit nonzero if the snapshot time object does not already exist.
+
+- Object keys in the overlay bucket beneath `__s3_snapshot_proxy__/` are
+  reserved for proxy use. Client PUT, POST, and DELETE requests against this
+  namespace return AccessDenied. Multi-object delete reports AccessDenied for
+  each reserved entry without modifying it.
 
 Compatible handling of DELETE requests
 

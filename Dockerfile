@@ -18,7 +18,7 @@ RUN uv sync --frozen --no-dev --no-install-project
 
 COPY app/ ./app
 ENV PYTHONUNBUFFERED=1
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "9000"]
+ENTRYPOINT ["python", "-m", "app.main"]
 
 FROM minio/mc@sha256:a7fe349ef4bd8521fb8497f55c6042871b2ae640607cf99d9bede5e9bdf11727 AS minio-waiter
 COPY tests/wait-for-buckets.sh /app/tests/wait-for-buckets.sh
