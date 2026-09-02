@@ -23,7 +23,7 @@ services:
         condition: service_completed_successfully
       overlay-bucket-init:
         condition: service_completed_successfully
-    entrypoint: "uvicorn app.main:app --host 0.0.0.0 --port 9000 --log-level debug"
+    entrypoint: "python -m app.main --log-level debug"
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:9000/health"]
       interval: 1s # Check every second (was 5s)
@@ -256,7 +256,7 @@ services:
         condition: service_completed_successfully
       iceberg-buckets-init:
         condition: service_completed_successfully
-    entrypoint: "uvicorn app.main:app --host 0.0.0.0 --port 9000 --log-level info"
+    entrypoint: "python -m app.main --log-level info"
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:9000/health"]
       interval: 2s
@@ -286,7 +286,7 @@ services:
         condition: service_completed_successfully
       iceberg-buckets-init:
         condition: service_completed_successfully
-    entrypoint: "sh -c 'sleep 8; uvicorn app.main:app --host 0.0.0.0 --port 9000 --log-level info'"
+    entrypoint: "sh -c 'sleep 8; python -m app.main --log-level info'"
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:9000/health"]
       interval: 2s
@@ -316,7 +316,7 @@ services:
         condition: service_completed_successfully
       iceberg-buckets-init:
         condition: service_completed_successfully
-    entrypoint: "sh -c 'sleep 16; uvicorn app.main:app --host 0.0.0.0 --port 9000 --log-level info'"
+    entrypoint: "sh -c 'sleep 16; python -m app.main --log-level info'"
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:9000/health"]
       interval: 2s
