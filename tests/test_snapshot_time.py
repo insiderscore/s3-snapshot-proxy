@@ -118,6 +118,26 @@ def test_require_existing_snapshot_time_does_not_create_one():
     assert client.put_calls == []
 
 
+@pytest.mark.parametrize("require_existing", [False, True])
+def test_missing_overlay_bucket_is_not_treated_as_a_missing_object(require_existing):
+    class MissingBucketClient(FakeSnapshotClient):
+        def get_object(self, **kwargs):
+            raise client_error("NoSuchBucket", 404)
+
+    client = MissingBucketClient()
+
+    with pytest.raises(botocore.exceptions.ClientError) as raised:
+        snapshot_time.initialize_snapshot_time(
+            client,
+            "missing-overlay",
+            None,
+            require_existing,
+        )
+
+    assert raised.value.response["Error"]["Code"] == "NoSuchBucket"
+    assert client.put_calls == []
+
+
 def test_configured_time_must_match_existing_snapshot():
     client = FakeSnapshotClient(stored=SNAPSHOT_B)
 

@@ -35,11 +35,7 @@ def s3_error_status(exc: botocore.exceptions.ClientError) -> Optional[int]:
 
 
 def snapshot_time_object_missing(exc: botocore.exceptions.ClientError) -> bool:
-    return s3_error_status(exc) == 404 or s3_error_code(exc) in {
-        "404",
-        "NoSuchKey",
-        "NotFound",
-    }
+    return s3_error_code(exc) == "NoSuchKey"
 
 
 def read_snapshot_time_object(s3_client, bucket: str) -> Optional[datetime]:
